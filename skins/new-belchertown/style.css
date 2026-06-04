@@ -2337,7 +2337,8 @@ p.entry-meta {
 }
 
 .curwindspeed,
-.curwindgust {
+.curwindgust,
+.curwindbeaufort {
   font-size: 30px;
 }
 
