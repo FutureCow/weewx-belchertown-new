@@ -202,6 +202,7 @@
         #end if
         #if $day.appTemp.has_data
         "appTemp": "$current.appTemp",
+        "appTemp_formatted": "$current.appTemp.toString($addLabel=False, $localize=False)",
         #end if
         "windchill": "$current.windchill",
         "heatindex": "$current.heatindex",
@@ -211,6 +212,7 @@
         "barometer_trend": "$trend.barometer",
         "barometer_trend_formatted": "$trend.barometer.formatted",
         "windspeed": "$current.windSpeed",
+        "windspeed_formatted": "$current.windSpeed.toString($addLabel=False, $localize=False)",
         "winddir": "$current.windDir",
         "winddir_formatted": "$current.windDir.formatted",
         "windGust": "$current.windGust",
