@@ -15,6 +15,13 @@
 #set $wind_table_cols = 3 if $beaufort_number_enabled else 2
 
 #include "header.html.tmpl"
+#if $beaufort_number_enabled
+<style>
+  .windtext { font-size: 16px; }
+  .curwindspeed, .curwindgust, .curwindbeaufort { font-size: 26px; }
+  .wind-table td.mph { font-size: 16px !important; }
+</style>
+#end if
 
 <script type="text/javascript">
     (function() {
