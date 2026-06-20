@@ -10,6 +10,9 @@
 #set $wind_compass_marker_context = build_wind_compass_marker_context($current.windDir.formatted, $current.windSpeed.knot.toString(addLabel=False, NONE_string=''), $current.windGust.knot.toString(addLabel=False, NONE_string=''))
 #set $wind_compass_marker_class = $wind_compass_marker_context.get("marker_class", "")
 #set $wind_compass_marker_style_attr = $wind_compass_marker_context.get("style_attr", "")
+#set $beaufort_number_enabled = $Extras.has_key("beaufort_number") and $Extras.beaufort_number == '1'
+#set $max_wind_gust_enabled = $Extras.has_key("max_wind_gust") and $Extras.max_wind_gust == '1'
+#set $wind_table_cols = 3 if $beaufort_number_enabled else 2
 
 #include "header.html.tmpl"
 
@@ -77,10 +80,14 @@
 
             // #if $Extras.has_key("beaufort_category") and $Extras.beaufort_category == '1' and $Extras.beaufort_category_gusts != '1'
             belchertown_set_html(".beaufort", beaufort_cat(kts_to_beaufort("$current.windSpeed.knot.toString(addLabel=False)")));
+            // #if $beaufort_number_enabled
             belchertown_set_html(".curwindbeaufort", kts_to_beaufort("$current.windSpeed.knot.toString(addLabel=False)"));
+            // #end if
             // #else
             belchertown_set_html(".beaufort", beaufort_cat(kts_to_beaufort("$current.windGust.knot.toString(addLabel=False)")));
+            // #if $beaufort_number_enabled
             belchertown_set_html(".curwindbeaufort", kts_to_beaufort("$current.windGust.knot.toString(addLabel=False)"));
+            // #end if
             // #end if
 
             get_outTemp_color("$unit.unit_type.outTemp", "$current.outTemp.formatted");
@@ -349,7 +356,9 @@
                                                     <tr>
                                                         <td class="windtext">$obs.label.wind_speed</td>
                                                         <td class="windtext border-left gust">$obs.label.wind_gust</td>
+                                                        #if $beaufort_number_enabled
                                                         <td class="windtext border-left">Bft</td>
+                                                        #end if
                                                     </tr>
                                                     <tr>
                                                         <td>
@@ -362,16 +371,20 @@
                                                                 $current.windGust.toString(addLabel=False, NONE_string="--")
                                                             </span>
                                                         </td>
+                                                        #if $beaufort_number_enabled
                                                         <td class="border-left">&nbsp;
                                                             <span class="curwindbeaufort">--</span>
                                                         </td>
+                                                        #end if
                                                     </tr>
                                                     <tr>
-                                                        <td class="mph" colspan="3">$unit.label.windSpeed</td>
+                                                        <td class="mph" colspan="$wind_table_cols">$unit.label.windSpeed</td>
                                                     </tr>
+                                                    #if $max_wind_gust_enabled
                                                     <tr>
-                                                        <td class="mph" colspan="3">Max: $day.wind.max.toString(addLabel=False, NONE_string="--") om $day.wind.maxtime</td>
+                                                        <td class="mph" colspan="$wind_table_cols">Max: $day.wind.max.toString(addLabel=False, NONE_string="--") om $day.wind.maxtime.format("%H:%M")</td>
                                                     </tr>
+                                                    #end if
                                                     #if $Extras.has_key("beaufort_category") and $Extras.beaufort_category == '1'
                                                     <tr>
                                                         <td class="beaufort" colspan="4"></td>
