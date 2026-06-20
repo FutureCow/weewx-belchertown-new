@@ -2333,13 +2333,13 @@ p.entry-meta {
 }
 
 .windtext {
-  font-size: 20px;
+  font-size: 16px;
 }
 
 .curwindspeed,
 .curwindgust,
 .curwindbeaufort {
-  font-size: 30px;
+  font-size: 26px;
 }
 
 .wind-table td.mph {
@@ -2347,7 +2347,8 @@ p.entry-meta {
   padding-bottom: 0 !important;
   line-height: 1;
   height: auto;
-  font-size: 18px !important;
+  font-size: 16px !important;
+  white-space: nowrap;
 }
 
 .wind-table td.beaufort {
