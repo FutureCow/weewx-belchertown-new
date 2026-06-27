@@ -15,17 +15,6 @@
 #set $wind_table_cols = 3 if $beaufort_number_enabled else 2
 
 #include "header.html.tmpl"
-#if $beaufort_number_enabled
-<style>
-  .windtext { font-size: 16px; }
-  .curwindspeed, .curwindgust, .curwindbeaufort { font-size: 26px; }
-  .wind-table { width: 100%; table-layout: fixed; }
-  .wind-table td { width: 33.33%; }
-  .wind-table td.mph { font-size: 16px !important; }
-  .homepage-card--wind .current_wind > .col-md-6 { flex: 0 0 42% !important; max-width: 42% !important; width: 42% !important; }
-  .homepage-card--wind .current_wind > .windspeedtable { flex: 0 0 58% !important; max-width: 58% !important; width: 58% !important; }
-</style>
-#end if
 
 <script type="text/javascript">
     (function() {

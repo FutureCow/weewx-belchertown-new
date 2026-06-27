@@ -2329,16 +2329,17 @@ p.entry-meta {
 
 .wind-table td {
   text-align: center !important;
-  width: 50%;
+  width: 33.33%;
 }
 
 .windtext {
-  font-size: 20px;
+  font-size: 16px;
 }
 
 .curwindspeed,
-.curwindgust {
-  font-size: 30px;
+.curwindgust,
+.curwindbeaufort {
+  font-size: 26px;
 }
 
 .wind-table td.mph {
@@ -2346,8 +2347,20 @@ p.entry-meta {
   padding-bottom: 0 !important;
   line-height: 1;
   height: auto;
-  font-size: 18px !important;
+  font-size: 16px !important;
   white-space: nowrap;
+}
+
+.homepage-card--wind .current_wind > .col-md-6 {
+  flex: 0 0 42% !important;
+  max-width: 42% !important;
+  width: 42% !important;
+}
+
+.homepage-card--wind .current_wind > .windspeedtable {
+  flex: 0 0 58% !important;
+  max-width: 58% !important;
+  width: 58% !important;
 }
 
 .wind-table td.beaufort {
@@ -3630,6 +3643,8 @@ table.celestial td.label {
 
 .frontpage .homepage-card--wind .wind-table {
   margin: 0 auto;
+  width: 100%;
+  table-layout: fixed;
 }
 
 .frontpage .homepage-card--radar {
