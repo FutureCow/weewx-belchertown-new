@@ -2327,10 +2327,18 @@ p.entry-meta {
   z-index: 99;
 }
 
+.wind-table {
+  width: 100%;
+  table-layout: fixed;
+}
+
 .wind-table td {
   text-align: center !important;
-  width: 33.33%;
 }
+
+.wind-table tr:first-child td:nth-child(1) { width: 33%; }
+.wind-table tr:first-child td:nth-child(2) { width: 45%; }
+.wind-table tr:first-child td:nth-child(3) { width: 22%; }
 
 .windtext {
   font-size: 16px;
