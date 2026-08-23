@@ -3,6 +3,32 @@ var belchertown_chart_resume_events_bound = false;
 var belchertown_chart_resume_refresh_in_progress = false;
 var belchertown_chart_resume_refresh_min_ms = 60000;
 var belchertown_rendered_chart_groups = {};
+var belchertown_chart_data_grouping_threshold = 2000;
+
+function belchertown_apply_automatic_data_grouping(seriesList) {
+    // Keep normal charts at their exact generated timestamps. For genuinely
+    // large datasets, group the whole chart so mixed series stay aligned.
+    var enabled = seriesList.some(function(series) {
+        return Array.isArray(series.data) && series.data.length >= belchertown_chart_data_grouping_threshold;
+    });
+
+    seriesList.forEach(function(series) {
+        // Wind barbs rely on Highstock's native grouping to thin the symbols,
+        // while their companion wind-speed line is kept ungrouped separately.
+        if (series.obsType === "windBarb") {
+            return;
+        }
+        // Hays charts rebuild their range series later and require every
+        // original high/low timestamp to preserve the polar envelope.
+        if (series.obsType === "haysChart") {
+            series.dataGrouping = {enabled: false};
+            return;
+        }
+        series.dataGrouping = {enabled: enabled};
+    });
+
+    return enabled;
+}
 
 function belchertown_track_chart_group(json_file, prepend_renderTo) {
     if (typeof json_file === "undefined" || json_file === null || json_file === "") {
@@ -113,6 +139,16 @@ function belchertown_configure_highcharts_defaults() {
         return;
     }
 
+    var highchartsRangeSelectorLabels = $charts_range_selector_labels_json;
+    var highchartsLang = $highcharts_lang_json;
+    highchartsLang.months = dayjs.months();
+    highchartsLang.shortMonths = dayjs.monthsShort();
+    highchartsLang.weekdays = dayjs.weekdays();
+    highchartsLang.shortWeekdays = dayjs.weekdaysShort();
+    highchartsLang.decimalPoint = "$highcharts_decimal";
+    highchartsLang.thousandsSep = "$highcharts_thousands";
+    highchartsLang.rangeSelectorZoom = highchartsRangeSelectorLabels.zoom;
+
     Highcharts.setOptions({
         time: {
             timezoneOffset: $highcharts_timezoneoffset
@@ -122,6 +158,15 @@ function belchertown_configure_highcharts_defaults() {
                 fontFamily: 'Roboto, sans-serif',
                 fontSize: '14px',
                 fontWeight: '500'
+            }
+        },
+        navigator: {
+            xAxis: {
+                labels: {
+                    style: {
+                        textOutline: 'none'
+                    }
+                }
             }
         },
         title: {
@@ -136,14 +181,7 @@ function belchertown_configure_highcharts_defaults() {
                 fontWeight: '300'
             }
         },
-        lang: {
-            months: dayjs.months(),
-            shortMonths: dayjs.monthsShort(),
-            weekdays: dayjs.weekdays(),
-            shortWeekdays: dayjs.weekdaysShort(),
-            decimalPoint: "$highcharts_decimal",
-            thousandsSep: "$highcharts_thousands"
-        }
+        lang: highchartsLang
     });
 
     belchertown_highcharts_defaults_applied = true;
@@ -1384,6 +1422,8 @@ function showChart(json_file, prepend_renderTo = false) {
 
             belchertown_apply_flat_axis_ranges(options, seriesAnalysis);
 
+            belchertown_apply_automatic_data_grouping(options.series);
+
             // If windRose is present, configure a special chart to show that data
             if (observation_type == "windRose") {
                 var categories = $windrose_categories;
@@ -1661,6 +1701,7 @@ function showChart(json_file, prepend_renderTo = false) {
                     color: currentSeriesColor,
                     fillColor: currentSeriesColor,
                     connectEnds: false,
+                    dataGrouping: {enabled: false},
                 });
             }
 
@@ -1980,6 +2021,8 @@ function showChart(json_file, prepend_renderTo = false) {
             var useStockChart = (observation_type !== "windRose") && (xAxis_categories.length === 0 || observation_type === "weatherRange");
             var zoomControlsEnabled = zoomRequested && useStockChart;
             if (zoomControlsEnabled) {
+                var rangeSelectorLabels = $charts_range_selector_labels_json;
+                var rangeSelectorTitles = $charts_range_selector_titles_json;
                 options.chart.zooming.type = "x";
                 options.chart.zooming.mouseWheel.enabled = true;
                 options.scrollbar.enabled = true;
@@ -1988,29 +2031,36 @@ function showChart(json_file, prepend_renderTo = false) {
                 options.rangeSelector.buttons = [{
                     type: "day",
                     count: 1,
-                    text: "1d"
+                    text: rangeSelectorLabels.day,
+                    title: rangeSelectorTitles.day
                 }, {
                     type: "week",
                     count: 1,
-                    text: "1w"
+                    text: rangeSelectorLabels.week,
+                    title: rangeSelectorTitles.week
                 }, {
                     type: "month",
                     count: 1,
-                    text: "1m"
+                    text: rangeSelectorLabels.month,
+                    title: rangeSelectorTitles.month
                 }, {
                     type: "month",
                     count: 3,
-                    text: "3m"
+                    text: rangeSelectorLabels.three_months,
+                    title: rangeSelectorTitles.three_months
                 }, {
                     type: "ytd",
-                    text: "YTD"
+                    text: rangeSelectorLabels.ytd,
+                    title: rangeSelectorTitles.ytd
                 }, {
                     type: "year",
                     count: 1,
-                    text: "1y"
+                    text: rangeSelectorLabels.year,
+                    title: rangeSelectorTitles.year
                 }, {
                     type: "all",
-                    text: $charts_page_all_button_label_json
+                    text: rangeSelectorLabels.all,
+                    title: rangeSelectorTitles.all
                 }];
             }
             var chart = useStockChart ? Highcharts.stockChart(options) : Highcharts.chart(options);

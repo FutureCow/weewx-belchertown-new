@@ -2092,17 +2092,78 @@ p.entry-meta {
   width: 100%;
 }
 
-.wx-stn-alert a {
-  color: #b83a33;
+.wx-stn-alert-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35em;
 }
 
-.wx-stn-alert a:hover,
-.wx-stn-alert a:focus {
-  color: #8f2d27;
+.wx-stn-alert a.forecast-alert-badge {
+  display: inline-flex;
+  flex: 0 0 auto;
+  max-width: 100%;
+  padding: 0.05em 0.35em;
+  border-radius: 5px;
+  color: #fff;
+  font-size: 0.9em;
+  font-weight: normal;
+  line-height: 1.1;
+  text-decoration: none;
+  white-space: nowrap;
 }
 
-.wx-stn-alert i {
-  color: red;
+.wx-stn-alert a.forecast-alert-badge--active {
+  background-color: #b83a33;
+}
+
+.wx-stn-alert a.forecast-alert-badge--active:hover,
+.wx-stn-alert a.forecast-alert-badge--active:focus {
+  background-color: #8f2d27;
+  color: #fff;
+}
+
+.wx-stn-alert a.forecast-alert-badge--pending {
+  background-color: #6c757d;
+}
+
+.wx-stn-alert a.forecast-alert-badge--pending:hover,
+.wx-stn-alert a.forecast-alert-badge--pending:focus {
+  background-color: #565e64;
+  color: #fff;
+}
+
+.wx-stn-alert a.forecast-alert-badge:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.forecast-alert-modal-heading {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.forecast-alert-timing {
+  margin-top: 0.2em;
+  font-size: 0.9em;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.forecast-alert-timing:empty {
+  display: none;
+}
+
+.forecast-alert-modal-body {
+  overflow-wrap: break-word;
+}
+
+.forecast-alert-modal-body p {
+  margin-bottom: 0.75rem;
+}
+
+.forecast-alert-modal-body p:last-child {
+  margin-bottom: 0;
 }
 
 .wx-fb,
@@ -3330,6 +3391,18 @@ table.celestial td.label {
   line-height: 1.3;
 }
 
+.wx-aqi-category {
+  display: inline-block;
+  padding: 0.15em 0.35em;
+  border-radius: 5px;
+  font-size: 0.9em;
+  line-height: 1.1;
+  font-weight: normal;
+  white-space: nowrap;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
 .frontpage .homepage-card--temperature .feelslike {
   line-height: 1.25;
   white-space: nowrap;
@@ -4233,6 +4306,12 @@ table.celestial td.label {
   object-fit: cover;
 }
 
+/* Preserve the full frame for webcam and other directly linked tab images. */
+.frontpage .homepage-card--radar .belchertown-webcam-panel img,
+.frontpage .homepage-card--radar .belchertown-radar-tab-panel > a > img {
+  object-fit: contain;
+}
+
 .radar_image.radar_image--scaled-frame {
   position: relative;
   overflow: hidden;
@@ -4966,11 +5045,24 @@ span.highcharts-title {
 .about .wx-stn-info-current-obs,
 .reports .wx-stn-info-current-obs {
   order: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
+  display: grid;
+  grid-template-columns: auto auto;
+  grid-template-areas:
+    "icon icon"
+    "temp unit";
+  align-items: start;
   justify-content: center;
-  gap: 6px;
+  column-gap: 4px;
+  row-gap: 6px;
+}
+
+.charts .obs-header-icon,
+.records .obs-header-icon,
+.about .obs-header-icon,
+.reports .obs-header-icon {
+  grid-area: icon;
+  justify-self: center;
+  width: auto;
 }
 
 .charts .obs-header-icon img,
@@ -4986,26 +5078,26 @@ span.highcharts-title {
 .records .obs-header-outtemp,
 .about .obs-header-outtemp,
 .reports .obs-header-outtemp {
+  grid-area: temp;
   display: inline-block;
   font-size: 24px;
   font-weight: 500;
   line-height: 1.1;
+  justify-self: end;
 }
 
-/* The base .outtempunitlabelsuper rule (line ~1071) has no positioning
-   context to apply its `top` offset against here, since .obs-header-outtemp
-   was `display: block` and pushed the sup onto a new line entirely. Making
-   the temp span inline-block (above) keeps the sup on the same line; this
-   gives the sup its own relative positioning context so `top` actually
-   does something, without touching page-header.inc's markup at all. */
+/* Keep the page-header temperature unit readable and paired with the value. */
 .charts .outtempunitlabelsuper,
 .records .outtempunitlabelsuper,
 .about .outtempunitlabelsuper,
 .reports .outtempunitlabelsuper {
+  grid-area: unit;
+  align-self: start;
+  justify-self: start;
   position: relative;
-  top: -0.6em;
-  margin-left: 0.15em;
-  font-size: 50%;
+  top: 0;
+  margin-left: 0;
+  font-size: 15px;
   line-height: 1;
 }
 
@@ -6977,6 +7069,26 @@ body.pi::-webkit-scrollbar {
   fill: #666 !important;
 }
 
+.highcharts-navigator-xaxis.highcharts-axis-labels text,
+.highcharts-navigator-xaxis .highcharts-axis-labels text {
+  fill: #000 !important;
+  font-weight: 700;
+  paint-order: stroke fill;
+  stroke: #fff !important;
+  stroke-linejoin: round;
+  stroke-width: 2px !important;
+}
+
+.dark .highcharts-navigator-xaxis.highcharts-axis-labels text,
+.dark .highcharts-navigator-xaxis .highcharts-axis-labels text {
+  fill: #fff !important;
+  font-weight: 700;
+  paint-order: stroke fill;
+  stroke: #000 !important;
+  stroke-linejoin: round;
+  stroke-width: 2px !important;
+}
+
 .dark .highcharts-navigator-yaxis .highcharts-grid-line {
   stroke-width: 0;
 }
@@ -7049,12 +7161,25 @@ body.pi::-webkit-scrollbar {
   stroke-width: 0;
 }
 
-.dark .highcharts-range-label rect {
-  fill: none !important;
+.dark .highcharts-range-label rect,
+.dark .highcharts-crosshair-label .highcharts-label-box {
+  fill: rgba(42, 42, 43, 0.95) !important;
+  stroke: #707073 !important;
+  stroke-width: 1px;
 }
 
-.dark .highcharts-range-label text {
-  fill: #e0e0e3 !important;
+.dark .highcharts-range-label text,
+.dark .highcharts-crosshair-label text {
+  fill: #f0f0f0 !important;
+  stroke: none !important;
+  stroke-width: 0 !important;
+}
+
+.dark .highcharts-range-label .highcharts-text-outline,
+.dark .highcharts-crosshair-label .highcharts-text-outline {
+  fill: none !important;
+  stroke: none !important;
+  stroke-width: 0 !important;
 }
 
 .dark .highcharts-range-input rect {
@@ -7081,12 +7206,7 @@ body.pi::-webkit-scrollbar {
 }
 
 .dark .highcharts-crosshair-label text {
-  fill: #2a2a2b !important;
   font-size: 1.1em;
-}
-
-.dark .highcharts-crosshair-label .highcharts-label-box {
-  fill: inherit !important;
 }
 
 .dark .highcharts-candlestick-series .highcharts-point {

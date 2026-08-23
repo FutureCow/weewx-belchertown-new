@@ -91,13 +91,13 @@
                 connect(); // Begin mqtt after WeeWX initial load
             }
 
-            // #if $Extras.has_key("reload_hook_images") and $Extras.reload_hook_images == '1'
-            // Update any images in the radar section or hooks
-
             // #if $Extras.has_key("reload_images_radar") and $Extras.reload_images_radar != '-1'
             var reload_radar_timer = $Extras.reload_images_radar * 1000; // convert to millis
             setTimeout(function() {ajaximages("radar", $Extras.reload_images_radar);}, reload_radar_timer);
             // #end if
+
+            // #if $Extras.has_key("reload_hook_images") and $Extras.reload_hook_images == '1'
+            // Update any images in the hooks
 
             // #if $Extras.has_key("reload_images_hook_asi") and $Extras.reload_images_hook_asi != '-1'
             var reload_asi_timer = $Extras.reload_images_hook_asi * 1000; // convert to millis
@@ -219,7 +219,7 @@
                                         </div>
                                         #if $Extras.has_key("aqi_enabled_kiosk") and $Extras.aqi_enabled_kiosk == '1'
                                         <div class="aqi_outer">
-                                            $obs.label.aqi: <span class="wx-aqi">$aqi</span> (<span class="wx-aqi-category">$aqi_category</span>)
+                                            $obs.label.aqi: <span class="wx-aqi">$aqi</span> <span class="wx-aqi-category">$aqi_category</span>
                                             #if $Extras.has_key("aqi_location_enabled") and $Extras.aqi_location_enabled == '1'
                                             <span class="aqi_location_outer"><br>$aqi_location</span>
                                             #end if

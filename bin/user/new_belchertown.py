@@ -56,11 +56,24 @@ if weewx.__version__ < "5":
 log = logging.getLogger(__name__)
 
 # Print version in syslog for easier troubleshooting
-VERSION = "2.1beta3"
-log.info(f"version {VERSION}")
+log.info("version 2.1beta4")
 
-# Default timeout for all HTTP requests (seconds)
-DEFAULT_HTTP_TIMEOUT = 15
+HIGHCHARTS_LANG_DEFAULTS = OrderedDict(
+    [
+        ("contextButtonTitle", "Chart context menu"),
+        ("downloadCSV", "Download CSV"),
+        ("downloadJPEG", "Download JPEG image"),
+        ("downloadPDF", "Download PDF document"),
+        ("downloadPNG", "Download PNG image"),
+        ("downloadSVG", "Download SVG vector image"),
+        ("downloadXLS", "Download XLS"),
+        ("exitFullscreen", "Exit from full screen"),
+        ("hideData", "Hide data table"),
+        ("printChart", "Print chart"),
+        ("viewData", "View data table"),
+        ("viewFullscreen", "View in full screen"),
+    ]
+)
 
 # Moment.js uses "nb" for Norwegian Bokmal while some upstream forecast APIs
 # and older configs use "no".
@@ -190,6 +203,12 @@ VALID_FORECAST_PROVIDERS = (
     "pirateweather",
 )
 
+VALID_AQI_SOURCES = (
+    "auto",
+    "local",
+    "forecast",
+)
+
 VALID_FORECAST_UNITS = (
     "us",
     "si",
@@ -284,8 +303,6 @@ AQI_OBS_MAP = {
     "so2": {"pollutant": "so2", "value_key": "valuePPB"},
 }
 
-LOCAL_AQI_PROVIDER = "local-sensor"
-
 # EPA/AirNow PM2.5 AQI breakpoints, updated for the 2024 PM NAAQS revision.
 # Concentrations are PM2.5 micrograms per cubic meter, truncated to 0.1 first.
 PM25_AQI_BREAKPOINTS = (
@@ -338,8 +355,6 @@ WINDROSE_SPEED_RANGE_LABELS = {
     "beaufort": ["0", "1", "2", "3", "4", "5", "6+"],
 }
 
-WIND_COMPASS_CALM_THRESHOLD_KNOTS = 1.0
-
 # Cached minifier dependency status: (all_available: bool, missing: tuple[str, ...])
 _MINIFIER_DEPS_STATUS = None
 _MINIFIER_DEPS_MISSING_LOGGED = False
@@ -349,6 +364,68 @@ EXTERNAL_STATION_OBSERVATION_SOURCES = {
     "cloud_cover": {"source_key": "current_conditions"},
     "aqi": {"source_key": "aqi"},
 }
+
+
+def _calculate_out_wetbulb_c(temp_c, humidity):
+    """Return outdoor wet-bulb temperature in C using Stull's approximation."""
+    try:
+        temp_c = float(temp_c)
+        humidity = float(humidity)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(temp_c) or not math.isfinite(humidity):
+        return None
+    if humidity < 0.0 or humidity > 100.0:
+        return None
+
+    return (
+        temp_c * math.atan(0.151977 * math.sqrt(humidity + 8.313659))
+        + math.atan(temp_c + humidity)
+        - math.atan(humidity - 1.676331)
+        + 0.00391838 * (humidity ** 1.5) * math.atan(0.023101 * humidity)
+        - 4.686035
+    )
+
+
+class OutWetbulbXType(weewx.xtypes.XType):
+    """Calculate outWetbulb from outTemp and outHumidity when not archived."""
+
+    def get_scalar(self, obs_type, record, db_manager=None, **option_dict):
+        if obs_type != "outWetbulb":
+            raise weewx.UnknownType(obs_type)
+        if (
+            not record
+            or record.get("outTemp") is None
+            or record.get("outHumidity") is None
+        ):
+            raise weewx.CannotCalculate(obs_type)
+
+        try:
+            temp_c = weewx.units.convert(
+                weewx.units.as_value_tuple(record, "outTemp"), "degree_C"
+            )[0]
+        except Exception:
+            raise weewx.CannotCalculate(obs_type)
+
+        wetbulb_c = _calculate_out_wetbulb_c(temp_c, record.get("outHumidity"))
+        if wetbulb_c is None:
+            raise weewx.CannotCalculate(obs_type)
+
+        if record.get("usUnits") == weewx.US:
+            wetbulb = weewx.units.convert(
+                (wetbulb_c, "degree_C", "group_temperature"), "degree_F"
+            )[0]
+            unit = "degree_F"
+        else:
+            wetbulb = wetbulb_c
+            unit = "degree_C"
+
+        return weewx.units.ValueTuple(wetbulb, unit, "group_temperature")
+
+
+if not any(isinstance(xtype, OutWetbulbXType) for xtype in weewx.xtypes.xtypes):
+    weewx.xtypes.xtypes.append(OutWetbulbXType())
 
 
 # Module-level helper functions for wind compass rendering
@@ -392,7 +469,7 @@ def build_wind_compass_marker_context(
     direction,
     wind_speed_knots,
     wind_gust_knots,
-    calm_threshold_knots=WIND_COMPASS_CALM_THRESHOLD_KNOTS,
+    calm_threshold_knots=1.0,
 ):
     wind_values = [
         value for value in (
@@ -419,7 +496,7 @@ def build_wind_compass_marker_context(
 # Module-level helper functions for HTTP and JSON processing
 
 
-def _http_get_json(url, headers=None, timeout=DEFAULT_HTTP_TIMEOUT):
+def _http_get_json(url, headers=None, timeout=15):
     """Fetch JSON data from an HTTP endpoint and parse as UTF-8 JSON."""
     req_headers = headers or HTTP_HEADERS["PIRATE_WEATHER"]
     req = Request(url, headers=req_headers)
@@ -427,7 +504,7 @@ def _http_get_json(url, headers=None, timeout=DEFAULT_HTTP_TIMEOUT):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_get_text(url, headers=None, timeout=DEFAULT_HTTP_TIMEOUT):
+def _http_get_text(url, headers=None, timeout=15):
     """Fetch text from an HTTP endpoint."""
     req_headers = headers or HTTP_HEADERS["PIRATE_WEATHER"]
     req = Request(url, headers=req_headers)
@@ -631,12 +708,48 @@ def _write_json_file(file_path, payload):
         json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
 
 
+def _write_normalized_forecast_file(file_path, payload):
+    """Validate a normalized forecast before replacing its cache file."""
+    _validate_normalized_forecast(payload)
+    _write_json_file(file_path, payload)
+
+
 def _canonical_forecast_provider(provider):
     """Return the provider key used in normalized forecast payloads."""
     provider_key = str(provider or "").strip().lower()
     if provider_key == "xweather":
         return "aeris"
     return provider_key
+
+
+def _normalize_aqi_source(aqi_source):
+    """Normalize the configured AQI source selection."""
+    source_key = str(aqi_source or "").strip().lower()
+    source_key = {
+        "local-sensor": "local",
+        "local_sensor": "local",
+        "provider": "forecast",
+        "remote": "forecast",
+    }.get(source_key, source_key)
+    if source_key in VALID_AQI_SOURCES:
+        return source_key
+
+    log.warning(
+        "Invalid aqi_source '%s'. Valid values are: %s. Falling back to 'auto'.",
+        aqi_source,
+        ", ".join(VALID_AQI_SOURCES),
+    )
+    return "auto"
+
+
+def _aqi_forecast_provider_for_forecast_provider(forecast_provider):
+    """Return the AQI provider used by a forecast provider, if any."""
+    provider_key = _canonical_forecast_provider(forecast_provider)
+    if provider_key in ("nws", "open-meteo"):
+        return "open-meteo"
+    if provider_key == "aeris":
+        return "aeris"
+    return None
 
 
 def _forecast_units_from_weewx_target(config_dict):
@@ -684,6 +797,25 @@ def _openmeteo_unit_params(forecast_units):
     return OPENMETEO_UNIT_PARAMS.get(forecast_units, OPENMETEO_UNIT_PARAMS["us"])
 
 
+def _highcharts_lang_options(skin_dict):
+    """Return Highcharts language options, overlaid with skin translations."""
+    highcharts_lang = OrderedDict(HIGHCHARTS_LANG_DEFAULTS)
+    texts_dict = (skin_dict or {}).get("Texts", {})
+    if not isinstance(texts_dict, (dict, configobj.Section)):
+        return highcharts_lang
+
+    configured_lang = texts_dict.get("Highcharts", {})
+    if not isinstance(configured_lang, (dict, configobj.Section)):
+        return highcharts_lang
+
+    for key in highcharts_lang:
+        value = configured_lang.get(key)
+        if value not in (None, ""):
+            highcharts_lang[key] = str(value)
+
+    return highcharts_lang
+
+
 def _forecast_cache_matches_config(forecast_file, forecast_provider, forecast_units):
     """Return True when cached forecast JSON was generated for this provider/units."""
     try:
@@ -711,18 +843,214 @@ def _forecast_cache_matches_config(forecast_file, forecast_provider, forecast_un
     )
 
 
+def _forecast_cache_generated_at(forecast_file):
+    """Return the cached forecast data timestamp, independent of file mtime."""
+    try:
+        with open(forecast_file, "r", encoding="utf-8") as read_file:
+            cached = json.load(read_file)
+    except Exception as e:
+        log.debug(f"Forecast cache timestamp check failed: {e}")
+        return None
+
+    if not isinstance(cached, dict):
+        return None
+
+    generated_at = _safe_epoch(cached.get("generated_at"))
+    if generated_at is not None:
+        return generated_at
+    return _safe_epoch(cached.get("timestamp"))
+
+
+def _forecast_failure_cache_path(forecast_file):
+    """Return the sidecar path used to throttle repeated forecast failures."""
+    return os.path.join(os.path.dirname(forecast_file), ".forecast_failure.json")
+
+
+def _load_forecast_failure_records(failure_file):
+    """Load forecast provider failure records."""
+    try:
+        with open(failure_file, "r", encoding="utf-8") as read_file:
+            cached = json.load(read_file)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log.debug(f"Forecast failure cache read failed: {e}")
+        return []
+
+    if not isinstance(cached, dict):
+        return []
+
+    records = cached.get("failures", [])
+    if isinstance(records, dict):
+        records = list(records.values())
+    if not isinstance(records, list):
+        return []
+
+    return [record for record in records if isinstance(record, dict)]
+
+
+def _write_forecast_failure_records(failure_file, records):
+    """Persist forecast provider failure records, removing the sidecar when empty."""
+    records = [record for record in records if isinstance(record, dict)]
+    if records:
+        _write_json_file(
+            failure_file,
+            {
+                "schema": "belchertown.forecast.failures.v1",
+                "failures": records,
+            },
+        )
+        return
+
+    try:
+        os.remove(failure_file)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.debug(f"Forecast failure cache cleanup failed: {e}")
+
+
+def _forecast_failure_record_matches(
+    record,
+    forecast_provider,
+    forecast_units,
+    forecast_place,
+    failure_kind="forecast",
+):
+    """Return True when a failure record applies to this provider/config."""
+    return (
+        str(record.get("kind", "forecast")) == str(failure_kind)
+        and _canonical_forecast_provider(record.get("provider"))
+        == _canonical_forecast_provider(forecast_provider)
+        and str(record.get("units", "")) == str(forecast_units or "")
+        and str(record.get("place", "")) == str(forecast_place or "")
+    )
+
+
+def _forecast_failure_retry_delay(
+    failure_file,
+    forecast_provider,
+    forecast_units,
+    forecast_place,
+    current_time,
+    retry_interval,
+    failure_kind="forecast",
+):
+    """Return remaining retry cooldown seconds for a provider/config."""
+    if retry_interval <= 0:
+        return 0
+
+    for record in _load_forecast_failure_records(failure_file):
+        if not _forecast_failure_record_matches(
+            record,
+            forecast_provider,
+            forecast_units,
+            forecast_place,
+            failure_kind=failure_kind,
+        ):
+            continue
+
+        retry_after = _safe_epoch(record.get("retry_after"))
+        if retry_after is None:
+            last_failed_at = _safe_epoch(record.get("last_failed_at"))
+            if last_failed_at is not None:
+                retry_after = last_failed_at + retry_interval
+
+        if retry_after is not None and retry_after > current_time:
+            return int(retry_after - current_time)
+
+    return 0
+
+
+def _record_forecast_failure(
+    failure_file,
+    forecast_provider,
+    forecast_units,
+    forecast_place,
+    current_time,
+    retry_interval,
+    failure_kind="forecast",
+):
+    """Record a provider failure so later calls can skip the cooldown window."""
+    if retry_interval <= 0:
+        return
+
+    records = []
+    for record in _load_forecast_failure_records(failure_file):
+        if _forecast_failure_record_matches(
+            record,
+            forecast_provider,
+            forecast_units,
+            forecast_place,
+            failure_kind=failure_kind,
+        ):
+            continue
+
+        retry_after = _safe_epoch(record.get("retry_after"))
+        if retry_after is None or retry_after > current_time:
+            records.append(record)
+
+    records.append(
+        {
+            "kind": str(failure_kind),
+            "provider": _canonical_forecast_provider(forecast_provider),
+            "units": str(forecast_units or ""),
+            "place": str(forecast_place or ""),
+            "last_failed_at": int(current_time),
+            "retry_after": int(current_time + retry_interval),
+        }
+    )
+
+    try:
+        _write_forecast_failure_records(failure_file, records)
+    except Exception as e:
+        log.debug(f"Forecast failure cache write failed: {e}")
+
+
+def _clear_forecast_failure(
+    failure_file,
+    forecast_provider,
+    forecast_units,
+    forecast_place,
+    failure_kind="forecast",
+):
+    """Clear a provider/config failure record after a successful refresh."""
+    records = [
+        record
+        for record in _load_forecast_failure_records(failure_file)
+        if not _forecast_failure_record_matches(
+            record,
+            forecast_provider,
+            forecast_units,
+            forecast_place,
+            failure_kind=failure_kind,
+        )
+    ]
+    try:
+        _write_forecast_failure_records(failure_file, records)
+    except Exception as e:
+        log.debug(f"Forecast failure cache cleanup failed: {e}")
+
+
 def _write_current_conditions_from_forecast(forecast_file, current_conditions_file):
     """Write current_conditions.json from forecast.json current object."""
     with open(forecast_file, "r", encoding="utf-8") as rf:
         data_cc = json.load(rf)
 
+    _validate_normalized_forecast(data_cc, require_current=True)
+    current = data_cc.get("current")
+    if isinstance(current, list):
+        current = current[0]
+
     cc_out = {
         "timestamp": int(time.time()),
         "provider": data_cc.get("provider"),
         "units": data_cc.get("units"),
+        "schema": "belchertown.current.v1",
         "source": "forecast",
-        "current": [data_cc.get("current", {})],
+        "current": [current],
     }
+    _validate_normalized_current_conditions(cc_out)
     _write_json_file(current_conditions_file, cc_out)
 
 
@@ -1495,12 +1823,24 @@ UNIT_SWITCH_GROUP_KINDS = {
     "group_speed": "speed",
     "group_distance": "distance",
     "group_altitude": "altitude",
+    "group_concentration": "concentration",
 }
 
 
-def _unit_switch_kind_for_observation(obs_name):
+def _station_observation_group(obs_name, value_helper=None):
+    """Return the unit group attached to a station observation value."""
+    value_t = getattr(value_helper, "value_t", None)
+    try:
+        if value_t and value_t[2]:
+            return value_t[2]
+    except (IndexError, TypeError):
+        pass
+    return weewx.units.obs_group_dict.get(obs_name)
+
+
+def _unit_switch_kind_for_observation(obs_name, value_helper=None):
     """Return the front-end unit-switch kind for a WeeWX observation."""
-    obs_group = weewx.units.obs_group_dict.get(obs_name)
+    obs_group = _station_observation_group(obs_name, value_helper)
     return UNIT_SWITCH_GROUP_KINDS.get(obs_group)
 
 
@@ -1522,18 +1862,51 @@ def _unit_switch_selector(obs_name):
     return "." + str(obs_name)
 
 
+def _unit_format_decimals(format_string):
+    """Return decimal places represented by a printf-style unit format."""
+    match = re.search(r"\.([0-9]+)[eEfFgG]$", str(format_string or ""))
+    if match:
+        return int(match.group(1))
+    if re.search(r"[diu]$", str(format_string or "")):
+        return 0
+    return None
+
+
 def _unit_switch_station_observation_meta(obs_name, value_helper, decimals=None):
     """Build client-side unit-switch metadata for a station observation."""
-    kind = _unit_switch_kind_for_observation(obs_name)
+    obs_group = _station_observation_group(obs_name, value_helper)
+    kind = _unit_switch_kind_for_observation(obs_name, value_helper)
     selector = _unit_switch_selector(obs_name)
     raw_value = _unit_switch_raw_from_value_helper(value_helper)
-    if not kind or selector is None or raw_value is None:
+    if selector is None or raw_value is None:
+        return None
+    if obs_group == "group_time":
+        return {
+            "selector": selector,
+            "kind": "time",
+            "raw": raw_value,
+        }
+    if not kind:
         return None
     meta = {
         "selector": selector,
         "kind": kind,
         "raw": raw_value,
     }
+    value_t = getattr(value_helper, "value_t", None)
+    try:
+        unit_name = value_t[1]
+    except (IndexError, TypeError):
+        unit_name = None
+    if unit_name:
+        meta["unit_name"] = unit_name
+        formatter = getattr(value_helper, "formatter", None)
+        if formatter is not None:
+            meta["unit_label"] = formatter.get_label_string(unit_name)
+            if decimals is None:
+                decimals = _unit_format_decimals(
+                    formatter.get_format_string(unit_name)
+                )
     if decimals is not None:
         meta["decimals"] = decimals
     return meta
@@ -1927,7 +2300,7 @@ def _local_aqi_payload(aqi_value, timestamp, method, pm25_value=None):
                 ],
             }
         ],
-        "provider": LOCAL_AQI_PROVIDER,
+        "provider": "local-sensor",
         "method": method,
     }
 
@@ -2119,8 +2492,10 @@ def _fetch_xweather_aqi_payload(forecast_place, forecast_api_id, forecast_api_se
         f"?format=json&client_id={forecast_api_id}&client_secret={forecast_api_secret}"
     )
     aqi_payload = _http_get_json(aqi_url, headers=HTTP_HEADERS["AERIS_WEATHER"])
-    if isinstance(aqi_payload, dict):
-        aqi_payload.setdefault("provider", "aeris")
+    aqi_response = _aeris_success_response(aqi_payload, "air quality")
+    if not isinstance(aqi_response, list) or not aqi_response:
+        raise ValueError("Xweather air-quality response contained no usable data")
+    aqi_payload.setdefault("provider", "aeris")
     return aqi_payload
 
 
@@ -2133,8 +2508,48 @@ def _merge_aqi_payload_into_forecast_file(forecast_file, aqi_payload):
         forecast_data = json.load(fh)
 
     forecast_data["aqi"] = [aqi_payload]
-    _write_json_file(forecast_file, forecast_data)
+    _write_normalized_forecast_file(forecast_file, forecast_data)
     return True
+
+
+def _cached_aqi_provider_from_forecast_data(forecast_data, aqi_payload):
+    """Return the provider key for a cached AQI payload."""
+    if not isinstance(aqi_payload, dict):
+        return ""
+    provider = aqi_payload.get("provider")
+    if not provider:
+        provider = (forecast_data or {}).get("provider")
+    return _canonical_forecast_provider(provider)
+
+
+def _clear_aqi_payload_from_forecast_file(forecast_file, allowed_providers=None):
+    """Remove cached AQI when it is not allowed by the selected AQI source."""
+    try:
+        if not os.path.isfile(forecast_file):
+            return False
+        with open(forecast_file, "r", encoding="utf-8") as fh:
+            forecast_data = json.load(fh)
+        if not isinstance(forecast_data, dict) or "aqi" not in forecast_data:
+            return False
+
+        if allowed_providers is not None:
+            allowed = {
+                _canonical_forecast_provider(provider)
+                for provider in allowed_providers
+            }
+            aqi_array = forecast_data.get("aqi") or []
+            aqi_payload = aqi_array[0] if aqi_array else None
+            if _cached_aqi_provider_from_forecast_data(
+                forecast_data, aqi_payload
+            ) in allowed:
+                return False
+
+        del forecast_data["aqi"]
+        _write_normalized_forecast_file(forecast_file, forecast_data)
+        return True
+    except Exception as e:
+        log.debug(f"Cached AQI cleanup skipped: {e}")
+        return False
 
 
 def _load_aqi_payload_from_forecast_file(forecast_file, require_success=False):
@@ -2152,8 +2567,8 @@ def _load_aqi_payload_from_forecast_file(forecast_file, require_success=False):
             and forecast_data.get("provider")
         ):
             aqi_payload = dict(aqi_payload)
-            aqi_payload["provider"] = _canonical_forecast_provider(
-                forecast_data.get("provider")
+            aqi_payload["provider"] = _cached_aqi_provider_from_forecast_data(
+                forecast_data, aqi_payload
             )
         if require_success and not (aqi_payload and aqi_payload.get("success")):
             return None
@@ -2420,6 +2835,78 @@ def _parse_aeris_json(obj):
         return {}
 
 
+def _aeris_success_response(payload, endpoint):
+    """Return a successful Xweather response or raise a useful failure."""
+    if not isinstance(payload, dict):
+        raise ValueError(f"Xweather {endpoint} response was not a JSON object")
+
+    if payload.get("success") is not True:
+        error = payload.get("error")
+        if isinstance(error, dict):
+            error_code = str(error.get("code") or "unknown_error").strip()
+            error_description = str(
+                error.get("description") or "request was not successful"
+            ).strip()
+            error_detail = f"{error_code}: {error_description}"
+        else:
+            error_detail = "request was not successful"
+        raise ValueError(f"Xweather {endpoint} request failed ({error_detail})")
+
+    return payload.get("response")
+
+
+def _aeris_forecast_periods(payload, endpoint):
+    """Return required Xweather forecast periods from a successful response."""
+    response = _aeris_success_response(payload, endpoint)
+    if not isinstance(response, list) or not response:
+        raise ValueError(f"Xweather {endpoint} response contained no forecast data")
+
+    forecast = response[0]
+    if not isinstance(forecast, dict):
+        raise ValueError(f"Xweather {endpoint} response was malformed")
+
+    periods = forecast.get("periods")
+    if (
+        not isinstance(periods, list)
+        or not periods
+        or not all(isinstance(period, dict) and period for period in periods)
+    ):
+        raise ValueError(f"Xweather {endpoint} response contained no usable periods")
+    return periods
+
+
+def _aeris_current_data(payload, current_conditions):
+    """Return usable Xweather observation or conditions data."""
+    endpoint = {
+        "obs": "observations",
+        "conds": "conditions",
+    }.get(current_conditions, "current conditions")
+    response = _aeris_success_response(payload, endpoint)
+
+    if current_conditions in ("obs", "obs-on-fail-conds"):
+        if isinstance(response, dict):
+            observation = response.get("ob")
+            if isinstance(observation, dict) and observation:
+                return observation
+        if current_conditions == "obs":
+            raise ValueError("Xweather observations response contained no usable observation")
+
+    if current_conditions in ("conds", "obs-on-fail-conds"):
+        if isinstance(response, list) and response and isinstance(response[0], dict):
+            periods = response[0].get("periods")
+            if (
+                isinstance(periods, list)
+                and periods
+                and isinstance(periods[0], dict)
+                and periods[0]
+            ):
+                return periods[0]
+        if current_conditions == "conds":
+            raise ValueError("Xweather conditions response contained no usable period")
+
+    raise ValueError("Xweather current-conditions response contained no usable data")
+
+
 def _warn_legacy_option_names(section_dict, section_name, legacy_mapping):
     """Warn about legacy option names without treating them as aliases."""
 
@@ -2448,6 +2935,18 @@ LABELS_GENERIC_LEGACY_MAPPING = {
     "graphs_windDir_ordinals": "charts_windDir_ordinals",
 }
 
+CHART_LABEL_TOKEN_RE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}"
+)
+CHART_TEXT_SERIES_OPTIONS = frozenset(
+    (
+        "yAxis_label",
+        "yAxis_label_unit",
+        "yAxis_plotLine_label",
+    )
+)
+_UNRESOLVED_CHART_LABEL_TOKENS = set()
+
 
 def _warn_legacy_options(extras_dict, label_generic_dict=None):
     """Check for deprecated/legacy option names and warn users."""
@@ -2460,6 +2959,51 @@ def _warn_legacy_options(extras_dict, label_generic_dict=None):
         )
 
     return extras_dict
+
+
+def _resolve_chart_label_text(value, label_generic_dict, context="charts.conf"):
+    """Resolve ${label_key} tokens in chart-facing text."""
+
+    if isinstance(value, list):
+        return [
+            _resolve_chart_label_text(item, label_generic_dict, context)
+            for item in value
+        ]
+
+    if not isinstance(value, str) or "$" not in value:
+        return value
+
+    if not isinstance(label_generic_dict, (dict, configobj.Section)):
+        label_generic_dict = {}
+
+    source = value.replace("$$", "\0NEW_BELCHERTOWN_CHART_LITERAL_DOLLAR\0")
+    unresolved_tokens = []
+
+    def replace_label_token(match_obj):
+        label_key = match_obj.group(1)
+        if label_key in label_generic_dict:
+            label_value = label_generic_dict.get(label_key)
+            return "" if label_value is None else str(label_value)
+
+        unresolved_tokens.append(match_obj.group(0))
+        return match_obj.group(0)
+
+    resolved = CHART_LABEL_TOKEN_RE.sub(replace_label_token, source)
+    resolved = resolved.replace("\0NEW_BELCHERTOWN_CHART_LITERAL_DOLLAR\0", "$")
+
+    for token in unresolved_tokens:
+        warn_key = (context, token)
+        if warn_key in _UNRESOLVED_CHART_LABEL_TOKENS:
+            continue
+        _UNRESOLVED_CHART_LABEL_TOKENS.add(warn_key)
+        log.warning(
+            "New Belchertown: charts.conf label token '%s' in %s has no "
+            "matching [Labels][Generic] entry.",
+            token,
+            context,
+        )
+
+    return resolved
 
 
 def _safe_float(value):
@@ -2528,6 +3072,145 @@ def _safe_epoch(value):
     if epoch_value is None:
         return None
     return int(epoch_value)
+
+
+_NORMALIZED_FORECAST_SIGNAL_FIELDS = (
+    "summary",
+    "icon",
+    "temperature",
+    "temperatureHigh",
+    "temperatureLow",
+    "apparentTemperature",
+    "apparentTemperatureHigh",
+    "apparentTemperatureLow",
+    "windSpeed",
+    "windGust",
+    "humidity",
+    "pressure",
+    "pressureMSL",
+    "visibility",
+    "dewPoint",
+    "precipIntensity",
+    "rain",
+    "showers",
+    "snowfall",
+    "cloudCover",
+    "weatherCode",
+    "uvIndex",
+)
+
+_NORMALIZED_CURRENT_SIGNAL_FIELDS = _NORMALIZED_FORECAST_SIGNAL_FIELDS + (
+    "windBearing",
+)
+
+
+def _normalized_signal_is_usable(value):
+    """Return True for a real normalized weather value, including numeric zero."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return math.isfinite(value)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "unknown", "n/a", "none", "null")
+    return False
+
+
+def _validate_normalized_weather_record(record, fields, context):
+    """Require a timestamp and at least one usable weather value."""
+    if not isinstance(record, dict) or not record:
+        raise ValueError(f"Normalized {context} record was missing or malformed")
+
+    timestamp = _safe_epoch(record.get("time"))
+    if timestamp is None or timestamp <= 0:
+        raise ValueError(f"Normalized {context} record had no valid timestamp")
+
+    if not any(
+        _normalized_signal_is_usable(record.get(field)) for field in fields
+    ):
+        raise ValueError(f"Normalized {context} record contained no usable weather data")
+    return timestamp
+
+
+def _validate_normalized_forecast(payload, require_current=None):
+    """Validate the provider-independent forecast cache contract."""
+    if not isinstance(payload, dict):
+        raise ValueError("Normalized forecast was not a JSON object")
+    if payload.get("schema") != "belchertown.forecast.v1":
+        raise ValueError("Normalized forecast schema was missing or unsupported")
+
+    provider = _canonical_forecast_provider(payload.get("provider"))
+    valid_providers = {
+        _canonical_forecast_provider(item) for item in VALID_FORECAST_PROVIDERS
+    }
+    if provider not in valid_providers:
+        raise ValueError("Normalized forecast provider was missing or unsupported")
+    if payload.get("units") not in VALID_FORECAST_UNITS:
+        raise ValueError("Normalized forecast units were missing or unsupported")
+    if _safe_epoch(payload.get("generated_at")) is None:
+        raise ValueError("Normalized forecast generation time was missing or invalid")
+
+    for collection_name in ("hourly", "threeHourly", "daily"):
+        rows = payload.get(collection_name)
+        if not isinstance(rows, list) or not rows:
+            raise ValueError(
+                f"Normalized forecast contained no usable {collection_name} periods"
+            )
+
+        previous_timestamp = None
+        for row in rows:
+            timestamp = _validate_normalized_weather_record(
+                row,
+                _NORMALIZED_FORECAST_SIGNAL_FIELDS,
+                f"forecast {collection_name}",
+            )
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ValueError(
+                    f"Normalized forecast {collection_name} periods were not chronological"
+                )
+            previous_timestamp = timestamp
+
+    if require_current is None:
+        require_current = provider != "aeris"
+
+    current = payload.get("current")
+    if isinstance(current, list):
+        current = current[0] if current else None
+    if require_current or current:
+        _validate_normalized_weather_record(
+            current,
+            _NORMALIZED_CURRENT_SIGNAL_FIELDS,
+            "current conditions",
+        )
+    return payload
+
+
+def _validate_normalized_current_conditions(payload):
+    """Validate the provider-independent current-conditions cache contract."""
+    if not isinstance(payload, dict):
+        raise ValueError("Normalized current conditions were not a JSON object")
+    if payload.get("schema") != "belchertown.current.v1":
+        raise ValueError("Normalized current-conditions schema was missing or unsupported")
+
+    provider = _canonical_forecast_provider(payload.get("provider"))
+    valid_providers = {
+        _canonical_forecast_provider(item) for item in VALID_FORECAST_PROVIDERS
+    }
+    if provider not in valid_providers:
+        raise ValueError("Normalized current-conditions provider was missing or unsupported")
+    if payload.get("units") not in VALID_FORECAST_UNITS:
+        raise ValueError("Normalized current-conditions units were missing or unsupported")
+
+    current = payload.get("current")
+    if not isinstance(current, list) or not current:
+        raise ValueError("Normalized current conditions contained no current record")
+    _validate_normalized_weather_record(
+        current[0],
+        _NORMALIZED_CURRENT_SIGNAL_FIELDS,
+        "current conditions",
+    )
+    return payload
 
 
 def _local_hour_is_divisible(ts, divisor):
@@ -2770,9 +3453,16 @@ def _aeris_period_to_common(period, interval, forecast_units, label_dict, icon_m
 
 def _aeris_alerts_to_common(alerts_payload, label_dict):
     """Normalize Aeris/Xweather alert payload to the common alert schema."""
-    alerts_response = (
-        ((alerts_payload or {}).get("alerts") or [{}])[0].get("response") or []
-    )
+    alert_payloads = (alerts_payload or {}).get("alerts")
+    if not alert_payloads:
+        return []
+    if not isinstance(alert_payloads, list) or not isinstance(alert_payloads[0], dict):
+        raise ValueError("Xweather alerts response was malformed")
+
+    alerts_response = _aeris_success_response(alert_payloads[0], "alerts")
+    if not isinstance(alerts_response, list):
+        raise ValueError("Xweather alerts response was malformed")
+
     output = []
     for alert in alerts_response:
         details = (alert or {}).get("details") or {}
@@ -2803,14 +3493,14 @@ def _aeris_transform_to_belch(aeris_payload, forecast_units, label_dict, icon_ma
     aeris_payload = aeris_payload or {}
 
     def _periods(interval):
-        try:
-            return (
-                aeris_payload.get(interval, [{}])[0]
-                .get("response", [{}])[0]
-                .get("periods", [])
-            )
-        except Exception:
-            return []
+        endpoint_payloads = aeris_payload.get(interval)
+        if (
+            not isinstance(endpoint_payloads, list)
+            or not endpoint_payloads
+            or not isinstance(endpoint_payloads[0], dict)
+        ):
+            raise ValueError(f"Xweather {interval} response was missing")
+        return _aeris_forecast_periods(endpoint_payloads[0], interval)
 
     hourly = _slice_from_current_period(
         [
@@ -2836,6 +3526,9 @@ def _aeris_transform_to_belch(aeris_payload, forecast_units, label_dict, icon_ma
         for p in _periods("forecast_24hr")
     ]
 
+    if not hourly or not three_hourly or not daily:
+        raise ValueError("Xweather forecast response contained no current forecast periods")
+
     return {
         "current": [],
         "hourly": hourly,
@@ -2853,20 +3546,15 @@ def _aeris_transform_to_belch(aeris_payload, forecast_units, label_dict, icon_ma
 def _aeris_current_to_common(current_payload, current_conditions, forecast_units, label_dict, icon_map):
     """Map Aeris/Xweather current-condition response to the common current schema."""
     current_payload = current_payload or {}
-    response = ((current_payload.get("current") or [{}])[0]).get("response")
-    current_data = None
+    current_payloads = current_payload.get("current")
+    if isinstance(current_payloads, list) and current_payloads:
+        endpoint_payload = current_payloads[0]
+    elif "success" in current_payload:
+        endpoint_payload = current_payload
+    else:
+        raise ValueError("Xweather current-conditions response was missing")
 
-    if current_conditions == "obs" and isinstance(response, dict):
-        current_data = response.get("ob")
-    elif current_conditions == "conds" and isinstance(response, list):
-        current_data = (((response[0] or {}).get("periods") or [{}])[0] if response else None)
-    elif current_conditions == "obs-on-fail-conds":
-        if isinstance(response, dict):
-            current_data = response.get("ob")
-        if current_data is None and isinstance(response, list) and response:
-            current_data = ((response[0] or {}).get("periods") or [{}])[0]
-
-    current_data = current_data or {}
+    current_data = _aeris_current_data(endpoint_payload, current_conditions)
     visibility = (
         _safe_float(current_data.get("visibilityKM"))
         if forecast_units in ("si", "ca")
@@ -2944,13 +3632,6 @@ ALMANAC_DIAGRAM_DEFAULTS = {
     "center_apex_mode": "transit",
 }
 
-# Baseline viewport used to normalize curve amplification behavior. When users
-# increase configured SVG height relative to width, vertical curve amplitude is
-# increased in Python rather than stretching via SVG aspect-ratio tricks.
-ALMANAC_BASELINE_SVG_WIDTH = 200.0
-ALMANAC_BASELINE_SVG_HEIGHT = 250.0
-
-
 def _apply_almanac_diagram_extras_overrides(extras_dict):
     """Apply optional almanac diagram mode from [Extras]."""
 
@@ -2976,11 +3657,6 @@ def _apply_almanac_diagram_extras_overrides(extras_dict):
                 "Valid values are: off, now, transit. Using default 'transit'.",
                 mode_raw,
             )
-
-# Resolution for sampled day tracks used to build sun/moon SVG path geometry.
-# Smaller values produce denser curves that better align with live alt/az points.
-ALMANAC_DIAGRAM_SAMPLE_STEP_MINUTES = 30
-ALMANAC_DIAGRAM_MOON_SAMPLE_STEP_MINUTES = 30
 
 def get_almanac_diagram_defaults():
     """Return centralized defaults for almanac diagram rendering."""
@@ -3026,12 +3702,12 @@ def _get_vertical_scale():
     if scale is None:
         return 1.0
 
-    svg_width = _safe_float(ALMANAC_DIAGRAM_DEFAULTS.get("svg_width", ALMANAC_BASELINE_SVG_WIDTH))
-    svg_height = _safe_float(ALMANAC_DIAGRAM_DEFAULTS.get("svg_height", ALMANAC_BASELINE_SVG_HEIGHT))
+    svg_width = _safe_float(ALMANAC_DIAGRAM_DEFAULTS.get("svg_width", 200.0))
+    svg_height = _safe_float(ALMANAC_DIAGRAM_DEFAULTS.get("svg_height", 250.0))
     if svg_width is None or svg_height is None or svg_width <= 0:
         return max(0.0, scale)
 
-    baseline_ratio = ALMANAC_BASELINE_SVG_HEIGHT / ALMANAC_BASELINE_SVG_WIDTH
+    baseline_ratio = 250.0 / 200.0
     ratio = svg_height / svg_width
     amplification = ratio / baseline_ratio if baseline_ratio > 0 else 1.0
 
@@ -3558,13 +4234,26 @@ def _build_almanac_svg_markup(payload, current_ts):
         wrap_x=use_x_offsets,
     )
 
+    sun_track = (
+        f'<path class="almanac-diagram-track almanac-diagram-track--sun" '
+        f'd="{html.escape(sun_path_d)}"></path>'
+    )
+    moon_track = (
+        f'<path class="almanac-diagram-track almanac-diagram-track--moon" '
+        f'd="{html.escape(moon_path_d)}"></path>'
+    )
+    sun_altitude = _safe_float(payload.get("sun_alt_attr"))
+    if sun_altitude is not None and sun_altitude >= 0:
+        track_markup = moon_track + sun_track
+    else:
+        track_markup = sun_track + moon_track
+
     return (
         f'<svg class="almanac-diagram-svg" width="{svg_width:.1f}" height="{svg_height:.1f}" '
         f'viewBox="{viewbox_x:.1f} {viewbox_y:.1f} {viewbox_w:.1f} {viewbox_h:.1f}" '
         'preserveAspectRatio="xMidYMid meet" role="img" aria-label="Sun and moon">'
         f'<line class="almanac-diagram-horizon" x1="{min_x:.1f}" y1="0" x2="{max_x:.1f}" y2="0"></line>'
-        f'<path class="almanac-diagram-track almanac-diagram-track--sun" d="{html.escape(sun_path_d)}"></path>'
-        f'<path class="almanac-diagram-track almanac-diagram-track--moon" d="{html.escape(moon_path_d)}"></path>'
+        f"{track_markup}"
         f"{moon_group}"
         f"{sun_group}"
         "</svg>"
@@ -3803,8 +4492,8 @@ def build_daylight_change_string(
 def build_almanac_diagram_payload(
     almanac_obj,
     current_ts,
-    sample_step_minutes=ALMANAC_DIAGRAM_SAMPLE_STEP_MINUTES,
-    moon_sample_step_minutes=ALMANAC_DIAGRAM_MOON_SAMPLE_STEP_MINUTES,
+    sample_step_minutes=30,
+    moon_sample_step_minutes=30,
 ):
     """Compute almanac diagram payload in Python.
 
@@ -4192,9 +4881,127 @@ class getData(SearchList):
     """Collect all custom data and calculations, then return search list extension."""
 
     RECORDS_OPTIONAL_OBSERVATIONS = ("appTemp", "windrun", "UV", "radiation", "sunshineDur")
+    NOAA_SEARCH_LIST_KEYS = (
+        "noaa_header_html",
+        "default_noaa_file",
+        "default_noaa_file_json",
+        "available_noaa_files_json",
+        "noaa_relative_dir_json",
+    )
 
     def __init__(self, generator):
         SearchList.__init__(self, generator)
+        # WeeWX creates one search-list extension instance per report run.
+        self._shared_search_list_extension = None
+        self._shared_html_root = None
+
+    def _get_timespan_binder(self, timespan, db_lookup):
+        """Build the one search-list value that is specific to a template."""
+        return TimespanBinder(
+            timespan,
+            db_lookup,
+            formatter=self.generator.formatter,
+            converter=self.generator.converter,
+            skin_dict=self.generator.skin_dict,
+        )
+
+    @staticmethod
+    def _get_noaa_search_list_values(html_root):
+        """Return the NOAA index, which can change as templates are generated."""
+        years = set()
+        noaa_header_html = ""
+        default_noaa_file = ""
+        noaa_file_list = []
+        noaa_relative_dir = "noaa"
+        noaa_dir = os.path.join(html_root, noaa_relative_dir)
+
+        try:
+            for html_root_entry in os.listdir(html_root):
+                html_root_entry_path = os.path.join(html_root, html_root_entry)
+                if (
+                    html_root_entry.lower() == "noaa"
+                    and os.path.isdir(html_root_entry_path)
+                ):
+                    noaa_relative_dir = html_root_entry
+                    noaa_dir = html_root_entry_path
+                    break
+
+            # Only process NOAA report files; ignore any other files (csv, etc.) in the directory.
+            noaa_file_pattern = re.compile(r"^NOAA-(\d{4})(?:-(\d{2}))?\.txt$")
+            noaa_file_list = [
+                f for f in os.listdir(noaa_dir)
+                if noaa_file_pattern.match(f)
+            ]
+            noaa_file_set = set(noaa_file_list)  # O(1) membership tests
+
+            # Generate a list of years based on file name
+            for f in noaa_file_list:
+                noaa_file_match = noaa_file_pattern.match(f)
+                if noaa_file_match:
+                    years.add(noaa_file_match.group(1))
+
+            years = sorted(years, reverse=True)
+
+            # Build NOAA header HTML using list then join for efficiency
+            noaa_parts = []
+            for y in years:
+                # Link to the year file
+                if f"NOAA-{y}.txt" in noaa_file_set:
+                    noaa_parts.append(
+                        f"""<a href="?yr={y}" class="noaa_rep_nav"><b>{y}</b></a>:"""
+                    )
+                else:
+                    noaa_parts.append(
+                        f"""<span class="noaa_rep_nav"><b>{y}</b></span>:"""
+                    )
+
+                # Loop through all 12 months and find if the file exists.  If
+                # the file doesn't exist, just show the month name in the
+                # header without a href link.  There is no month 13, but we
+                # need to loop to 12, so 13 is where it stops.
+                month_links = []
+                for i in range(1, 13):
+                    month_num = f"{i:02d}"  # Pad the number with a 0 since the NOAA files use 2 digit month
+                    month_abbr = calendar.month_abbr[i]
+                    if f"NOAA-{y}-{month_num}.txt" in noaa_file_set:
+                        month_links.append(
+                            f"""<a href="?yr={y}&amp;mo={month_num}" class="noaa_rep_nav"><b>{month_abbr}</b></a>"""
+                        )
+                    else:
+                        month_links.append(
+                            f"""<span class="noaa_rep_nav"><b>{month_abbr}</b></span>"""
+                        )
+
+                noaa_parts.append(" ".join(month_links))
+                noaa_parts.append("<br>")
+
+            noaa_header_html = "".join(noaa_parts)
+
+            # Find the current month's NOAA file for the default file to show
+            # on JavaScript page load.  The NOAA files are generated as part of
+            # this skin, but if for some reason that the month file doesn't
+            # exist, use the year file.
+            now = datetime.datetime.now()
+            current_year = str(now.year)
+            current_month = str(format(now.month, "02"))
+            if f"NOAA-{current_year}-{current_month}.txt" in noaa_file_set:
+                default_noaa_file = f"NOAA-{current_year}-{current_month}.txt"
+            elif f"NOAA-{current_year}.txt" in noaa_file_set:
+                default_noaa_file = f"NOAA-{current_year}.txt"
+            elif noaa_file_list:
+                default_noaa_file = sorted(noaa_file_list, reverse=True)[0]
+        except Exception:
+            # There's an error - I've seen this on first run and the NOAA
+            # folder is not created yet. Skip this section.
+            pass
+
+        return {
+            "noaa_header_html": noaa_header_html,
+            "default_noaa_file": default_noaa_file,
+            "default_noaa_file_json": json.dumps(default_noaa_file),
+            "available_noaa_files_json": json.dumps(sorted(noaa_file_list)),
+            "noaa_relative_dir_json": json.dumps(noaa_relative_dir),
+        }
 
     @staticmethod
     def _records_obs_available(db_manager, obs_type):
@@ -4442,6 +5249,16 @@ class getData(SearchList):
         """
         Build the data needed for the New Belchertown skin
         """
+        if self._shared_search_list_extension is not None:
+            search_list_extension = dict(self._shared_search_list_extension)
+            search_list_extension["alltime"] = self._get_timespan_binder(
+                timespan, db_lookup
+            )
+            search_list_extension.update(
+                self._get_noaa_search_list_values(self._shared_html_root)
+            )
+            return [search_list_extension]
+
         # Cache frequently accessed objects
         config_dict = self.generator.config_dict
         skin_dict = self.generator.skin_dict
@@ -4688,13 +5505,25 @@ class getData(SearchList):
         for chartgroup in chart_dict.sections:
             chart_group_config = chart_dict[chartgroup]
             charts[chartgroup] = list(chart_group_config.sections)
-            chartpage_titles[chartgroup] = chart_group_config.get("title", chartgroup)
+            chartpage_titles[chartgroup] = _resolve_chart_label_text(
+                chart_group_config.get("title", chartgroup),
+                label_generic_dict,
+                f"[{chartgroup}] title",
+            )
 
             if "page_content" in chart_group_config:
-                chartpage_content[chartgroup] = chart_group_config["page_content"]
+                chartpage_content[chartgroup] = _resolve_chart_label_text(
+                    chart_group_config["page_content"],
+                    label_generic_dict,
+                    f"[{chartgroup}] page_content",
+                )
 
             if chart_group_config.get("show_button", "").lower() == "true":
-                button_text = chart_group_config.get("button_text", chartgroup)
+                button_text = _resolve_chart_label_text(
+                    chart_group_config.get("button_text", chartgroup),
+                    label_generic_dict,
+                    f"[{chartgroup}] button_text",
+                )
                 button_parts.append(
                     f'<a href="./?chart={chartgroup}"><button type="button" class="btn btn-primary">{button_text}</button></a>'
                 )
@@ -4913,11 +5742,11 @@ class getData(SearchList):
             forces the value to target_unit (e.g. "mm", "km") regardless of
             skin.conf's configured unit_system, for the front-end unit
             switcher to re-convert from."""
-            if query_row is not None:
+            if query_row is not None and query_row[1] is not None:
                 value_tuple = (query_row[1], source_unit, group_name)
                 raw_val = weewx.units.convert(value_tuple, target_unit)[0]
                 return [query_row[0], raw_val]
-            return [calendar.timegm(time.gmtime()), 0.0]
+            return [None, None]
 
         rainiest_day_sql = """
             SELECT dateTime, sum FROM archive_day_rain
@@ -4945,26 +5774,43 @@ class getData(SearchList):
             week_rainiest_day_query, rain_unit, "group_rain", "mm"
         )
 
-        if records_obs_available["windrun"]:
-            week_windrun_maxsum_sql = """
-                SELECT dateTime, sum FROM archive_day_windrun
-                WHERE dateTime >= ? AND dateTime < ? ORDER BY sum DESC LIMIT 1;
+        def _query_windrun_maxsum(period_name, start_epoch=None, stop_epoch=None):
+            """Return the highest daily wind run for a bounded period."""
+            if not records_obs_available["windrun"]:
+                return None
+
+            conditions = ["sum IS NOT NULL"]
+            params = []
+            if start_epoch is not None:
+                conditions.append("dateTime >= ?")
+                params.append(start_epoch)
+            if stop_epoch is not None:
+                conditions.append("dateTime < ?")
+                params.append(stop_epoch)
+
+            day_table = f"{wx_manager.table_name}_day_windrun"
+            windrun_maxsum_sql = f"""
+                SELECT dateTime, sum FROM {day_table}
+                WHERE {' AND '.join(conditions)}
+                ORDER BY sum DESC, dateTime ASC LIMIT 1;
             """
             try:
-                week_windrun_maxsum_query = wx_manager.getSql(
-                    week_windrun_maxsum_sql,
-                    (week_daily_start_epoch, week_daily_stop_epoch),
-                )
+                return wx_manager.getSql(windrun_maxsum_sql, tuple(params))
             except Exception as e:
-                if "archive_day_windrun" in str(e):
-                    log.debug(
-                        "Wind run stats not available: archive_day_windrun table not found."
-                    )
-                else:
-                    log.debug(f"Skipping wind run stats: {e}")
-                week_windrun_maxsum_query = None
-        else:
-            week_windrun_maxsum_query = None
+                log.debug(f"Skipping {period_name} wind run stats: {e}")
+                return None
+
+        week_windrun_maxsum_query = _query_windrun_maxsum(
+            "weekly", week_daily_start_epoch, week_daily_stop_epoch
+        )
+        month_windrun_maxsum_query = _query_windrun_maxsum(
+            "monthly", month_start_epoch, week_daily_stop_epoch
+        )
+        year_windrun_maxsum_query = _query_windrun_maxsum(
+            "yearly", year_start_epoch, week_daily_stop_epoch
+        )
+        at_windrun_maxsum_query = _query_windrun_maxsum("all-time")
+
         week_windrun_maxsum = _convert_daily_summary_result(
             week_windrun_maxsum_query,
             windrun_unit,
@@ -4974,6 +5820,22 @@ class getData(SearchList):
         )
         week_windrun_maxsum_raw = _convert_daily_summary_result_raw(
             week_windrun_maxsum_query, windrun_unit, "group_distance", "km"
+        )
+        month_windrun_maxsum = _convert_daily_summary_result(
+            month_windrun_maxsum_query,
+            windrun_unit,
+            "group_distance",
+            windrun_round,
+            windrun_label,
+        )
+        month_windrun_maxsum_raw = _convert_daily_summary_result_raw(
+            month_windrun_maxsum_query, windrun_unit, "group_distance", "km"
+        )
+        year_windrun_maxsum_raw = _convert_daily_summary_result_raw(
+            year_windrun_maxsum_query, windrun_unit, "group_distance", "km"
+        )
+        at_windrun_maxsum_raw = _convert_daily_summary_result_raw(
+            at_windrun_maxsum_query, windrun_unit, "group_distance", "km"
         )
 
         at_rainiest_day_sql = """
@@ -5370,13 +6232,7 @@ class getData(SearchList):
         # This portion is right from the WeeWX sample
         # http://www.weewx.com/docs/customizing.htm
 
-        all_stats = TimespanBinder(
-            timespan,
-            db_lookup,
-            formatter=self.generator.formatter,
-            converter=self.generator.converter,
-            skin_dict=self.generator.skin_dict,
-        )
+        all_stats = self._get_timespan_binder(timespan, db_lookup)
 
         # Get the unit label from the skin dict for speed.
         windSpeed_unit = self.generator.skin_dict["Units"]["Groups"]["group_speed"]
@@ -5387,92 +6243,7 @@ class getData(SearchList):
         # ==============================================================================
         # Get NOAA Data
         # ==============================================================================
-        years = set()
-        noaa_header_html = ""
-        default_noaa_file = ""
-        noaa_file_list = []
-        noaa_relative_dir = "noaa"
-        noaa_dir = os.path.join(html_root, noaa_relative_dir)
-
-        try:
-            for html_root_entry in os.listdir(html_root):
-                html_root_entry_path = os.path.join(html_root, html_root_entry)
-                if (
-                    html_root_entry.lower() == "noaa"
-                    and os.path.isdir(html_root_entry_path)
-                ):
-                    noaa_relative_dir = html_root_entry
-                    noaa_dir = html_root_entry_path
-                    break
-
-            # Only process NOAA report files; ignore any other files (csv, etc.) in the directory.
-            noaa_file_pattern = re.compile(r"^NOAA-(\d{4})(?:-(\d{2}))?\.txt$")
-            noaa_file_list = [
-                f for f in os.listdir(noaa_dir)
-                if noaa_file_pattern.match(f)
-            ]
-            noaa_file_set = set(noaa_file_list)  # O(1) membership tests
-
-            # Generate a list of years based on file name
-            for f in noaa_file_list:
-                noaa_file_match = noaa_file_pattern.match(f)
-                if noaa_file_match:
-                    years.add(noaa_file_match.group(1))
-
-            years = sorted(years, reverse=True)
-
-            # Build NOAA header HTML using list then join for efficiency
-            noaa_parts = []
-            for y in years:
-                # Link to the year file
-                if f"NOAA-{y}.txt" in noaa_file_set:
-                    noaa_parts.append(
-                        f"""<a href="?yr={y}" class="noaa_rep_nav"><b>{y}</b></a>:"""
-                    )
-                else:
-                    noaa_parts.append(
-                        f"""<span class="noaa_rep_nav"><b>{y}</b></span>:"""
-                    )
-
-                # Loop through all 12 months and find if the file exists.  If
-                # the file doesn't exist, just show the month name in the
-                # header without a href link.  There is no month 13, but we
-                # need to loop to 12, so 13 is where it stops.
-                month_links = []
-                for i in range(1, 13):
-                    month_num = f"{i:02d}"  # Pad the number with a 0 since the NOAA files use 2 digit month
-                    month_abbr = calendar.month_abbr[i]
-                    if f"NOAA-{y}-{month_num}.txt" in noaa_file_set:
-                        month_links.append(
-                            f"""<a href="?yr={y}&amp;mo={month_num}" class="noaa_rep_nav"><b>{month_abbr}</b></a>"""
-                        )
-                    else:
-                        month_links.append(
-                            f"""<span class="noaa_rep_nav"><b>{month_abbr}</b></span>"""
-                        )
-
-                noaa_parts.append(" ".join(month_links))
-                noaa_parts.append("<br>")
-
-            noaa_header_html = "".join(noaa_parts)
-
-            # Find the current month's NOAA file for the default file to show
-            # on JavaScript page load.  The NOAA files are generated as part of
-            # this skin, but if for some reason that the month file doesn't
-            # exist, use the year file.
-            now = datetime.datetime.now()
-            current_year = str(now.year)
-            current_month = str(format(now.month, "02"))
-            if f"NOAA-{current_year}-{current_month}.txt" in noaa_file_set:
-                default_noaa_file = f"NOAA-{current_year}-{current_month}.txt"
-            elif f"NOAA-{current_year}.txt" in noaa_file_set:
-                default_noaa_file = f"NOAA-{current_year}.txt"
-            elif noaa_file_list:
-                default_noaa_file = sorted(noaa_file_list, reverse=True)[0]
-        except Exception:
-            # There's an error - I've seen this on first run and the NOAA
-            # folder is not created yet. Skip this section.
-            pass
+        noaa_search_list_values = self._get_noaa_search_list_values(html_root)
 
         # ==============================================================================
         # Forecast Data
@@ -5492,6 +6263,10 @@ class getData(SearchList):
         # Forecast enabled default should be on when missing.
         forecast_enabled = str(extras_dict.get("forecast_enabled", "1")).strip()
         aqi_enabled = to_bool(extras_dict.get("aqi_enabled", "0"))
+        aqi_source = _normalize_aqi_source(extras_dict.get("aqi_source", "auto"))
+        extras_dict["aqi_source"] = aqi_source
+        local_aqi_enabled = aqi_enabled and aqi_source in ("auto", "local")
+        forecast_aqi_enabled = aqi_enabled and aqi_source in ("auto", "forecast")
 
         # Ensure AQI variables are always defined to avoid NameError when forecast is disabled or fails
         # aqi and aqi_category are global so they can be used by Highcharts
@@ -5500,7 +6275,9 @@ class getData(SearchList):
         aqi_category = ""
         aqi_location = ""
         aqi_time = ""
-        local_aqi_payload = _archive_local_aqi_payload(manager) if aqi_enabled else None
+        local_aqi_payload = (
+            _archive_local_aqi_payload(manager) if local_aqi_enabled else None
+        )
         if local_aqi_payload is not None:
             (
                 aqi,
@@ -5527,6 +6304,7 @@ class getData(SearchList):
                 # Setup variables common to both forecast sources
                 forecast_file = f"{html_root}/json/forecast.json"
                 current_conditions_file = f"{html_root}/json/current_conditions.json"
+                forecast_failure_file = _forecast_failure_cache_path(forecast_file)
                 forecast_json_dir = os.path.dirname(forecast_file)
                 try:
                     os.makedirs(forecast_json_dir, exist_ok=True)
@@ -5564,6 +6342,37 @@ class getData(SearchList):
                 if belchertown_debug > 0:
                     log.info(f"forecast_place set to {forecast_place}")
 
+                def _provider_retry_delay(provider_key, failure_kind="forecast"):
+                    return _forecast_failure_retry_delay(
+                        forecast_failure_file,
+                        provider_key,
+                        forecast_units,
+                        forecast_place,
+                        current_time,
+                        300,
+                        failure_kind=failure_kind,
+                    )
+
+                def _record_provider_failure(provider_key, failure_kind="forecast"):
+                    _record_forecast_failure(
+                        forecast_failure_file,
+                        provider_key,
+                        forecast_units,
+                        forecast_place,
+                        current_time,
+                        300,
+                        failure_kind=failure_kind,
+                    )
+
+                def _clear_provider_failure(provider_key, failure_kind="forecast"):
+                    _clear_forecast_failure(
+                        forecast_failure_file,
+                        provider_key,
+                        forecast_units,
+                        forecast_place,
+                        failure_kind=failure_kind,
+                    )
+
                 def _cached_aqi_for_provider(provider_key):
                     cached_aqi = _load_aqi_payload_from_forecast_file(
                         forecast_file, require_success=True
@@ -5577,7 +6386,7 @@ class getData(SearchList):
                     return None
 
                 def _refresh_openmeteo_aqi_fallback(force=False):
-                    if not aqi_enabled:
+                    if not forecast_aqi_enabled:
                         return None
 
                     if not force:
@@ -5608,7 +6417,7 @@ class getData(SearchList):
                         return _cached_aqi_for_provider("open-meteo")
 
                 def _refresh_xweather_aqi_fallback(force=False):
-                    if not aqi_enabled:
+                    if not forecast_aqi_enabled:
                         return None
 
                     if not force:
@@ -5639,7 +6448,9 @@ class getData(SearchList):
                 def _refresh_local_aqi_payload():
                     nonlocal local_aqi_payload
                     local_aqi_payload = (
-                        _archive_local_aqi_payload(manager) if aqi_enabled else None
+                        _archive_local_aqi_payload(manager)
+                        if local_aqi_enabled
+                        else None
                     )
                     return local_aqi_payload
 
@@ -5647,23 +6458,52 @@ class getData(SearchList):
                     if not aqi_enabled:
                         return None
 
-                    aqi_payload = _refresh_local_aqi_payload()
-                    if aqi_payload is not None:
-                        try:
-                            if _merge_aqi_payload_into_forecast_file(
-                                forecast_file, aqi_payload
-                            ):
-                                log.debug("Local AQI cached to forecast.json")
-                        except Exception as e:
-                            log.warning(
-                                f"Local AQI cache update failed. Reason: {e}"
-                            )
-                        return aqi_payload
+                    if local_aqi_enabled:
+                        aqi_payload = _refresh_local_aqi_payload()
+                        if aqi_payload is not None:
+                            try:
+                                if _merge_aqi_payload_into_forecast_file(
+                                    forecast_file, aqi_payload
+                                ):
+                                    log.debug("Local AQI cached to forecast.json")
+                            except Exception as e:
+                                log.warning(
+                                    f"Local AQI cache update failed. Reason: {e}"
+                                )
+                            return aqi_payload
 
-                    provider_key = _canonical_forecast_provider(forecast_provider)
-                    if provider_key == "open-meteo":
+                        if aqi_source == "local":
+                            if _clear_aqi_payload_from_forecast_file(forecast_file):
+                                log.debug(
+                                    "Cached AQI removed because aqi_source is local "
+                                    "and no local AQI is available."
+                                )
+                            return None
+
+                    forecast_aqi_provider = (
+                        _aqi_forecast_provider_for_forecast_provider(
+                            forecast_provider
+                        )
+                    )
+                    if not forecast_aqi_enabled or forecast_aqi_provider is None:
+                        if _clear_aqi_payload_from_forecast_file(forecast_file):
+                            log.debug(
+                                "Cached AQI removed because no forecast AQI source "
+                                "is enabled."
+                            )
+                        return None
+
+                    if _clear_aqi_payload_from_forecast_file(
+                        forecast_file, allowed_providers=(forecast_aqi_provider,)
+                    ):
+                        log.debug(
+                            "Cached AQI removed because it does not match "
+                            f"aqi_source={aqi_source}."
+                        )
+
+                    if forecast_aqi_provider == "open-meteo":
                         return _refresh_openmeteo_aqi_fallback(force=force)
-                    if provider_key == "aeris":
+                    if forecast_aqi_provider == "aeris":
                         return _refresh_xweather_aqi_fallback(force=force)
                     return None
 
@@ -5695,15 +6535,18 @@ class getData(SearchList):
                     # new_belchertown.py is called 12 times per archive, so the last condition ensures forecast on the hour is only downloaded once
                     forecast_stat = os.stat(forecast_file)
                     file_modtime = int(forecast_stat.st_mtime)
+                    forecast_cache_time = (
+                        _forecast_cache_generated_at(forecast_file) or file_modtime
+                    )
                     archive_interval = int(
                         config_dict["StdArchive"]["archive_interval"]
                     )
                     forecast_is_stale = (
-                        (current_time - file_modtime) > forecast_stale_timer
+                        (current_time - forecast_cache_time) > forecast_stale_timer
                         or forecast_stat.st_size == 0
                         or (
                             int(time.strftime("%M")) < archive_interval / 60
-                            and (current_time - file_modtime) > archive_interval
+                            and (current_time - forecast_cache_time) > archive_interval
                         )
                     )
                     if not _forecast_cache_matches_config(
@@ -5735,25 +6578,39 @@ class getData(SearchList):
                 if forecast_provider == "pirateweather":
                     # Fetch → normalize → write forecast
                     if forecast_is_stale:
-                        try:
-                            url = f"https://api.pirateweather.net/forecast/{forecast_api_id}/{forecast_place}?units={forecast_units}&lang={forecast_lang}&exclude=minutely"
-                            pw_raw = _http_get_json(url)
-                            normalized = _pw_transform_to_belch(
-                                pw_raw,
-                                forecast_units,
-                            )
-                            _write_json_file(forecast_file, normalized)
+                        retry_delay = _provider_retry_delay("pirateweather")
+                        if retry_delay:
                             log.debug(
-                                f"New Pirate Weather forecast cached to {forecast_file}"
-                            ),
-                        except urllib.error.HTTPError as e:
-                            log.error(
-                                f"Pirate Weather HTTP error {e.code}: {e.reason}",
+                                "Pirate Weather forecast update skipped; previous "
+                                "failure cooldown has %s seconds remaining.",
+                                retry_delay,
                             )
-                        except ValueError as e:
-                            log.error(f"Pirate Weather missing config: {e}")
-                        except Exception as e:
-                            log.error(f"Pirate Weather update failed: {e}")
+                        else:
+                            try:
+                                url = f"https://api.pirateweather.net/forecast/{forecast_api_id}/{forecast_place}?units={forecast_units}&lang={forecast_lang}&exclude=minutely"
+                                pw_raw = _http_get_json(url)
+                                normalized = _pw_transform_to_belch(
+                                    pw_raw,
+                                    forecast_units,
+                                )
+                                _write_normalized_forecast_file(
+                                    forecast_file, normalized
+                                )
+                                _clear_provider_failure("pirateweather")
+                                log.debug(
+                                    f"New Pirate Weather forecast cached to {forecast_file}"
+                                ),
+                            except urllib.error.HTTPError as e:
+                                _record_provider_failure("pirateweather")
+                                log.error(
+                                    f"Pirate Weather HTTP error {e.code}: {e.reason}",
+                                )
+                            except ValueError as e:
+                                _record_provider_failure("pirateweather")
+                                log.error(f"Pirate Weather update rejected: {e}")
+                            except Exception as e:
+                                _record_provider_failure("pirateweather")
+                                log.error(f"Pirate Weather update failed: {e}")
                     else:
                         log.debug("Forecast is current, no update needed.")
 
@@ -5800,6 +6657,7 @@ class getData(SearchList):
                 elif forecast_provider == "nws":
                     # NWS does not require API id/secret, but does expect a descriptive User-Agent.
                     nws_forecast_failed = False
+                    nws_forecast_retry_suppressed = False
 
                     nws_lat, nws_lon = _resolve_forecast_lat_lon(
                         latitude, longitude, forecast_place
@@ -5807,83 +6665,97 @@ class getData(SearchList):
 
                     # Forecast file (daily/hourly/current + alerts)
                     if forecast_is_stale:
-                        try:
-                            points_url = f"https://api.weather.gov/points/{nws_lat},{nws_lon}"
-                            points_data = _http_get_json(
-                                points_url, headers=HTTP_HEADERS["NWS_WEATHER"]
-                            )
-                            points_props = points_data.get("properties", {})
-
-                            forecast_url = points_props.get("forecast")
-                            forecast_hourly_url = points_props.get("forecastHourly")
-                            stations_url = points_props.get("observationStations")
-
-                            if not forecast_url or not forecast_hourly_url:
-                                raise ValueError("NWS points response missing forecast URLs")
-
-                            forecast_24_data = _http_get_json(
-                                forecast_url, headers=HTTP_HEADERS["NWS_WEATHER"]
-                            )
-                            forecast_hourly_data = _http_get_json(
-                                forecast_hourly_url,
-                                headers=HTTP_HEADERS["NWS_WEATHER"],
-                            )
-
-                            observation_data = {}
-                            station_id = extras_dict.get("nws_station_id", "").strip()
-                            obs_latest_url = ""
-                            if station_id:
-                                obs_latest_url = (
-                                    f"https://api.weather.gov/stations/{station_id}/observations/latest"
-                                )
-                            elif stations_url:
-                                stations_data = _http_get_json(
-                                    stations_url,
-                                    headers=HTTP_HEADERS["NWS_WEATHER"],
-                                )
-                                stations = stations_data.get("features", [])
-                                if stations:
-                                    first_station_props = (
-                                        (stations[0] or {}).get("properties") or {}
-                                    )
-                                    first_station = first_station_props.get(
-                                        "stationIdentifier"
-                                    )
-                                    if first_station:
-                                        obs_latest_url = (
-                                            f"https://api.weather.gov/stations/{first_station}/observations/latest"
-                                        )
-                            if obs_latest_url:
-                                observation_data = _http_get_json(
-                                    obs_latest_url,
-                                    headers=HTTP_HEADERS["NWS_WEATHER"],
-                                )
-
-                            alerts_data = {}
-                            if extras_dict.get("forecast_alert_enabled") == "1":
-                                alerts_url = (
-                                    f"https://api.weather.gov/alerts/active?point={nws_lat},{nws_lon}"
-                                )
-                                alerts_data = _http_get_json(
-                                    alerts_url,
-                                    headers=HTTP_HEADERS["NWS_WEATHER"],
-                                )
-
-                            normalized = _nws_transform_to_belch(
-                                forecast_payload=forecast_24_data,
-                                hourly_payload=forecast_hourly_data,
-                                observation_payload=observation_data,
-                                alerts_payload=alerts_data,
-                                forecast_units=forecast_units,
-                            )
-                            _write_json_file(forecast_file, normalized)
-                            log.info(f"New NWS forecast cached to {forecast_file}")
-                        except Exception as e:
+                        retry_delay = _provider_retry_delay("nws")
+                        if retry_delay:
                             nws_forecast_failed = True
-                            log.warning(
-                                "NWS forecast update failed; treating forecast_enabled as 0 for this cycle. "
-                                f"Reason: {e}"
+                            nws_forecast_retry_suppressed = True
+                            log.debug(
+                                "NWS forecast update skipped; previous failure "
+                                "cooldown has %s seconds remaining.",
+                                retry_delay,
                             )
+                        else:
+                            try:
+                                points_url = f"https://api.weather.gov/points/{nws_lat},{nws_lon}"
+                                points_data = _http_get_json(
+                                    points_url, headers=HTTP_HEADERS["NWS_WEATHER"]
+                                )
+                                points_props = points_data.get("properties", {})
+
+                                forecast_url = points_props.get("forecast")
+                                forecast_hourly_url = points_props.get("forecastHourly")
+                                stations_url = points_props.get("observationStations")
+
+                                if not forecast_url or not forecast_hourly_url:
+                                    raise ValueError("NWS points response missing forecast URLs")
+
+                                forecast_24_data = _http_get_json(
+                                    forecast_url, headers=HTTP_HEADERS["NWS_WEATHER"]
+                                )
+                                forecast_hourly_data = _http_get_json(
+                                    forecast_hourly_url,
+                                    headers=HTTP_HEADERS["NWS_WEATHER"],
+                                )
+
+                                observation_data = {}
+                                station_id = extras_dict.get("nws_station_id", "").strip()
+                                obs_latest_url = ""
+                                if station_id:
+                                    obs_latest_url = (
+                                        f"https://api.weather.gov/stations/{station_id}/observations/latest"
+                                    )
+                                elif stations_url:
+                                    stations_data = _http_get_json(
+                                        stations_url,
+                                        headers=HTTP_HEADERS["NWS_WEATHER"],
+                                    )
+                                    stations = stations_data.get("features", [])
+                                    if stations:
+                                        first_station_props = (
+                                            (stations[0] or {}).get("properties") or {}
+                                        )
+                                        first_station = first_station_props.get(
+                                            "stationIdentifier"
+                                        )
+                                        if first_station:
+                                            obs_latest_url = (
+                                                f"https://api.weather.gov/stations/{first_station}/observations/latest"
+                                            )
+                                if obs_latest_url:
+                                    observation_data = _http_get_json(
+                                        obs_latest_url,
+                                        headers=HTTP_HEADERS["NWS_WEATHER"],
+                                    )
+
+                                alerts_data = {}
+                                if extras_dict.get("forecast_alert_enabled") == "1":
+                                    alerts_url = (
+                                        f"https://api.weather.gov/alerts/active?point={nws_lat},{nws_lon}"
+                                    )
+                                    alerts_data = _http_get_json(
+                                        alerts_url,
+                                        headers=HTTP_HEADERS["NWS_WEATHER"],
+                                    )
+
+                                normalized = _nws_transform_to_belch(
+                                    forecast_payload=forecast_24_data,
+                                    hourly_payload=forecast_hourly_data,
+                                    observation_payload=observation_data,
+                                    alerts_payload=alerts_data,
+                                    forecast_units=forecast_units,
+                                )
+                                _write_normalized_forecast_file(
+                                    forecast_file, normalized
+                                )
+                                _clear_provider_failure("nws")
+                                log.info(f"New NWS forecast cached to {forecast_file}")
+                            except Exception as e:
+                                nws_forecast_failed = True
+                                _record_provider_failure("nws")
+                                log.warning(
+                                    "NWS forecast update failed; treating forecast_enabled as 0 for this cycle. "
+                                    f"Reason: {e}"
+                                )
                     else:
                         log.debug("Forecast is current, no update needed.")
 
@@ -5933,14 +6805,21 @@ class getData(SearchList):
                             )
 
                     if nws_forecast_failed:
-                        log.warning(
-                            "NWS forecast is unavailable for this cycle. Falling back to Open-Meteo."
-                        )
+                        if nws_forecast_retry_suppressed:
+                            log.debug(
+                                "NWS forecast is unavailable due to a recent "
+                                "failure. Falling back to Open-Meteo."
+                            )
+                        else:
+                            log.warning(
+                                "NWS forecast is unavailable for this cycle. Falling back to Open-Meteo."
+                            )
                         forecast_provider = "open-meteo"
                     else:
                         _refresh_and_apply_aqi(force=forecast_is_stale)
                 if forecast_provider == "open-meteo":
                     openmeteo_forecast_failed = False
+                    openmeteo_forecast_retry_suppressed = False
 
                     om_lat, om_lon = _resolve_forecast_lat_lon(
                         latitude, longitude, forecast_place
@@ -5952,54 +6831,68 @@ class getData(SearchList):
                     )
 
                     if forecast_is_stale:
-                        try:
-                            om_url = (
-                                "https://api.open-meteo.com/v1/forecast"
-                                f"?latitude={om_lat}&longitude={om_lon}"
-                                "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
-                                "pressure_msl,surface_pressure,wind_speed_10m,wind_gusts_10m,wind_direction_10m,"
-                                "cloud_cover,visibility,dew_point_2m,precipitation,rain,showers,snowfall,"
-                                "weather_code,is_day"
-                                "&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,"
-                                "dew_point_2m,pressure_msl,surface_pressure,visibility,precipitation_probability,"
-                                "precipitation,rain,showers,snowfall,weather_code,is_day,cloud_cover,"
-                                "wind_speed_10m,wind_gusts_10m,wind_direction_10m"
-                                "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
-                                "apparent_temperature_max,apparent_temperature_min,precipitation_sum,"
-                                "rain_sum,showers_sum,snowfall_sum,precipitation_hours,"
-                                "precipitation_probability_max,cloud_cover_mean,relative_humidity_2m_mean,"
-                                "dew_point_2m_mean,wind_speed_10m_max,wind_gusts_10m_max,"
-                                "wind_direction_10m_dominant,sunrise,sunset,uv_index_max"
-                                f"&temperature_unit={om_temp_unit}"
-                                f"&wind_speed_unit={om_wind_unit}"
-                                f"&precipitation_unit={om_precip_unit}"
-                                "&timezone=auto&forecast_days=7"
-                            )
-                            om_raw = _http_get_json(
-                                om_url, headers=HTTP_HEADERS["OPEN_METEO"]
-                            )
-                            normalized = _openmeteo_transform_to_belch(
-                                om_raw, forecast_units
-                            )
-                            (
-                                normalized["alerts"],
-                                alert_provider,
-                            ) = _fetch_openmeteo_alerts(
-                                om_lat,
-                                om_lon,
-                                extras_dict,
-                                openmeteo_payload=om_raw,
-                            )
-                            if alert_provider:
-                                normalized["alert_provider"] = alert_provider
-                            _write_json_file(forecast_file, normalized)
-                            log.info(f"New Open-Meteo forecast cached to {forecast_file}")
-                        except Exception as e:
+                        retry_delay = _provider_retry_delay("open-meteo")
+                        if retry_delay:
                             openmeteo_forecast_failed = True
-                            log.warning(
-                                "Open-Meteo forecast update failed; treating forecast_enabled as 0 for this cycle. "
-                                f"Reason: {e}"
+                            openmeteo_forecast_retry_suppressed = True
+                            log.debug(
+                                "Open-Meteo forecast update skipped; previous "
+                                "failure cooldown has %s seconds remaining.",
+                                retry_delay,
                             )
+                        else:
+                            try:
+                                om_url = (
+                                    "https://api.open-meteo.com/v1/forecast"
+                                    f"?latitude={om_lat}&longitude={om_lon}"
+                                    "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
+                                    "pressure_msl,surface_pressure,wind_speed_10m,wind_gusts_10m,wind_direction_10m,"
+                                    "cloud_cover,visibility,dew_point_2m,precipitation,rain,showers,snowfall,"
+                                    "weather_code,is_day"
+                                    "&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,"
+                                    "dew_point_2m,pressure_msl,surface_pressure,visibility,precipitation_probability,"
+                                    "precipitation,rain,showers,snowfall,weather_code,is_day,cloud_cover,"
+                                    "wind_speed_10m,wind_gusts_10m,wind_direction_10m"
+                                    "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+                                    "apparent_temperature_max,apparent_temperature_min,precipitation_sum,"
+                                    "rain_sum,showers_sum,snowfall_sum,precipitation_hours,"
+                                    "precipitation_probability_max,cloud_cover_mean,relative_humidity_2m_mean,"
+                                    "dew_point_2m_mean,wind_speed_10m_max,wind_gusts_10m_max,"
+                                    "wind_direction_10m_dominant,sunrise,sunset,uv_index_max"
+                                    f"&temperature_unit={om_temp_unit}"
+                                    f"&wind_speed_unit={om_wind_unit}"
+                                    f"&precipitation_unit={om_precip_unit}"
+                                    "&timezone=auto&forecast_days=7"
+                                )
+                                om_raw = _http_get_json(
+                                    om_url, headers=HTTP_HEADERS["OPEN_METEO"]
+                                )
+                                normalized = _openmeteo_transform_to_belch(
+                                    om_raw, forecast_units
+                                )
+                                (
+                                    normalized["alerts"],
+                                    alert_provider,
+                                ) = _fetch_openmeteo_alerts(
+                                    om_lat,
+                                    om_lon,
+                                    extras_dict,
+                                    openmeteo_payload=om_raw,
+                                )
+                                if alert_provider:
+                                    normalized["alert_provider"] = alert_provider
+                                _write_normalized_forecast_file(
+                                    forecast_file, normalized
+                                )
+                                _clear_provider_failure("open-meteo")
+                                log.info(f"New Open-Meteo forecast cached to {forecast_file}")
+                            except Exception as e:
+                                openmeteo_forecast_failed = True
+                                _record_provider_failure("open-meteo")
+                                log.warning(
+                                    "Open-Meteo forecast update failed; treating forecast_enabled as 0 for this cycle. "
+                                    f"Reason: {e}"
+                                )
                     else:
                         log.debug("Forecast is current, no update needed.")
 
@@ -6047,6 +6940,11 @@ class getData(SearchList):
                             )
 
                     if openmeteo_forecast_failed:
+                        if openmeteo_forecast_retry_suppressed:
+                            log.debug(
+                                "Open-Meteo forecast is unavailable due to a "
+                                "recent failure."
+                            )
                         (
                             current_obs_icon,
                             current_obs_summary,
@@ -6103,111 +7001,141 @@ class getData(SearchList):
                     # File is stale, download a new copy
                     if forecast_is_stale:
                         forecast_file_result = None
-                        try:
-                            if "forecast_dev_file" in extras_dict:
-                                # Hidden option to use a pre-downloaded forecast file
-                                # rather than using API calls for no reason
-                                dev_forecast_file = extras_dict["forecast_dev_file"]
-                                req = Request(
-                                    dev_forecast_file,
-                                    None,
-                                    HTTP_HEADERS["AERIS_WEATHER"],
-                                )
-                                with urlopen(
-                                    req, timeout=DEFAULT_HTTP_TIMEOUT
-                                ) as response:
-                                    forecast_file_result = response.read()
-                                dev_payload = _parse_aeris_json(forecast_file_result)
-                                if dev_payload.get("schema") == "belchertown.forecast.v1":
-                                    dev_payload["units"] = forecast_units
-                                    forecast_file_result = json.dumps(dev_payload)
-                                else:
-                                    forecast_file_result = json.dumps(
-                                        _aeris_transform_to_belch(
+                        forecast_download_retry_suppressed = False
+                        retry_delay = 0
+                        if "forecast_dev_file" not in extras_dict:
+                            retry_delay = _provider_retry_delay(forecast_provider)
+                        if retry_delay:
+                            forecast_download_retry_suppressed = True
+                            log.debug(
+                                "Xweather forecast update skipped; previous "
+                                "failure cooldown has %s seconds remaining.",
+                                retry_delay,
+                            )
+                        else:
+                            try:
+                                if "forecast_dev_file" in extras_dict:
+                                    # Hidden option to use a pre-downloaded forecast file
+                                    # rather than using API calls for no reason
+                                    dev_forecast_file = extras_dict["forecast_dev_file"]
+                                    req = Request(
+                                        dev_forecast_file,
+                                        None,
+                                        HTTP_HEADERS["AERIS_WEATHER"],
+                                    )
+                                    with urlopen(
+                                        req, timeout=15
+                                    ) as response:
+                                        forecast_file_result = response.read()
+                                    dev_payload = _parse_aeris_json(forecast_file_result)
+                                    if dev_payload.get("schema") == "belchertown.forecast.v1":
+                                        dev_payload["units"] = forecast_units
+                                        normalized_forecast = dev_payload
+                                    else:
+                                        normalized_forecast = _aeris_transform_to_belch(
                                             dev_payload,
                                             forecast_units,
                                             label_dict,
                                             aeris_icon_map,
                                         )
+                                    _validate_normalized_forecast(normalized_forecast)
+                                    forecast_file_result = json.dumps(
+                                        normalized_forecast
                                     )
-                            else:
-                                # 24hr forecast (was Forecast)
-                                req = Request(
-                                    forecast_24hr_url,
-                                    None,
-                                    HTTP_HEADERS["AERIS_WEATHER"],
-                                )
-                                with urlopen(
-                                    req, timeout=DEFAULT_HTTP_TIMEOUT
-                                ) as response:
-                                    forecast_24hr_page = response.read()
-                                if belchertown_debug > 1:
-                                    log.info(f"Forecast 24hr URL: {forecast_24hr_url}")
-                                # 3hr forecast
-                                req = Request(
-                                    forecast_3hr_url,
-                                    None,
-                                    HTTP_HEADERS["AERIS_WEATHER"],
-                                )
-                                with urlopen(
-                                    req, timeout=DEFAULT_HTTP_TIMEOUT
-                                ) as response:
-                                    forecast_3hr_page = response.read()
-                                if belchertown_debug > 1:
-                                    log.info(f"Forecast 3hr URL: {forecast_3hr_url}")
-                                # 1hr forecast
-                                req = Request(
-                                    forecast_1hr_url,
-                                    None,
-                                    HTTP_HEADERS["AERIS_WEATHER"],
-                                )
-                                with urlopen(
-                                    req, timeout=DEFAULT_HTTP_TIMEOUT
-                                ) as response:
-                                    forecast_1hr_page = response.read()
-                                if belchertown_debug > 1:
-                                    log.info(f"Forecast 1hr URL: {forecast_1hr_url}")
-                                if extras_dict["forecast_alert_enabled"] == "1":
-                                    # Alerts
+                                else:
+                                    # 24hr forecast (was Forecast)
                                     req = Request(
-                                        forecast_alerts_url,
+                                        forecast_24hr_url,
                                         None,
                                         HTTP_HEADERS["AERIS_WEATHER"],
                                     )
                                     with urlopen(
-                                        req, timeout=DEFAULT_HTTP_TIMEOUT
+                                        req, timeout=15
                                     ) as response:
-                                        alerts_page = response.read()
+                                        forecast_24hr_page = response.read()
                                     if belchertown_debug > 1:
-                                        log.info(f"Alerts URL: {forecast_alerts_url}")
+                                        log.info(
+                                            "Xweather 24-hour forecast requested for %s",
+                                            forecast_place,
+                                        )
+                                    # 3hr forecast
+                                    req = Request(
+                                        forecast_3hr_url,
+                                        None,
+                                        HTTP_HEADERS["AERIS_WEATHER"],
+                                    )
+                                    with urlopen(
+                                        req, timeout=15
+                                    ) as response:
+                                        forecast_3hr_page = response.read()
+                                    if belchertown_debug > 1:
+                                        log.info(
+                                            "Xweather 3-hour forecast requested for %s",
+                                            forecast_place,
+                                        )
+                                    # 1hr forecast
+                                    req = Request(
+                                        forecast_1hr_url,
+                                        None,
+                                        HTTP_HEADERS["AERIS_WEATHER"],
+                                    )
+                                    with urlopen(
+                                        req, timeout=15
+                                    ) as response:
+                                        forecast_1hr_page = response.read()
+                                    if belchertown_debug > 1:
+                                        log.info(
+                                            "Xweather 1-hour forecast requested for %s",
+                                            forecast_place,
+                                        )
+                                    if extras_dict["forecast_alert_enabled"] == "1":
+                                        # Alerts
+                                        req = Request(
+                                            forecast_alerts_url,
+                                            None,
+                                            HTTP_HEADERS["AERIS_WEATHER"],
+                                        )
+                                        with urlopen(
+                                            req, timeout=15
+                                        ) as response:
+                                            alerts_page = response.read()
+                                        if belchertown_debug > 1:
+                                            log.info(
+                                                "Xweather alerts requested for %s",
+                                                forecast_place,
+                                            )
 
-                                # Combine all into 1 file - simplified parsing helper
+                                    # Combine all into 1 file - simplified parsing helper
 
-                                data = {
-                                    "timestamp": int(time.time()),
-                                    "forecast_24hr": [
-                                        _parse_aeris_json(forecast_24hr_page)
-                                    ],
-                                    "forecast_3hr": [
-                                        _parse_aeris_json(forecast_3hr_page)
-                                    ],
-                                    "forecast_1hr": [
-                                        _parse_aeris_json(forecast_1hr_page)
-                                    ],
-                                    "aqi": [],
-                                }
-                                if extras_dict.get("forecast_alert_enabled") == "1":
-                                    data["alerts"] = [_parse_aeris_json(alerts_page)]
-                                forecast_file_result = json.dumps(
-                                    _aeris_transform_to_belch(
+                                    data = {
+                                        "timestamp": int(time.time()),
+                                        "forecast_24hr": [
+                                            _parse_aeris_json(forecast_24hr_page)
+                                        ],
+                                        "forecast_3hr": [
+                                            _parse_aeris_json(forecast_3hr_page)
+                                        ],
+                                        "forecast_1hr": [
+                                            _parse_aeris_json(forecast_1hr_page)
+                                        ],
+                                        "aqi": [],
+                                    }
+                                    if extras_dict.get("forecast_alert_enabled") == "1":
+                                        data["alerts"] = [_parse_aeris_json(alerts_page)]
+                                    normalized_forecast = _aeris_transform_to_belch(
                                         data,
                                         forecast_units,
                                         label_dict,
                                         aeris_icon_map,
                                     )
-                                )
-                        except Exception as e:
-                            log.error(f"Error downloading forecast data: {e}")
+                                    _validate_normalized_forecast(normalized_forecast)
+                                    forecast_file_result = json.dumps(
+                                        normalized_forecast
+                                    )
+                            except Exception as e:
+                                if "forecast_dev_file" not in extras_dict:
+                                    _record_provider_failure(forecast_provider)
+                                log.error(f"Error downloading forecast data: {e}")
 
                         # Save forecast data to file. w+ creates the file if it doesn't
                         # exist, and truncates the file and re-writes it everytime
@@ -6218,6 +7146,7 @@ class getData(SearchList):
                                     log.info(
                                         f"New forecast file downloaded to {forecast_file}"
                                     )
+                                    _clear_provider_failure(forecast_provider)
                             except FileNotFoundError:
                                 log.info(
                                     "New Belchertown JSON folder does not exist. Usually this "
@@ -6228,144 +7157,160 @@ class getData(SearchList):
                                 log.error(
                                     f"Error writing forecast info to {forecast_file}. Reason: {e}"
                                 )
-                        else:
+                        elif not forecast_download_retry_suppressed:
                             log.info(
                                 "Forecast download failed; keeping existing forecast file if present."
                             )
 
                     # File is stale, download a new copy
                     if current_conditions_is_stale:
-                        forecast_file_result = None
-                        try:
-                            if "current_conditions_dev_file" in extras_dict:
-                                # Hidden option to use a pre-downloaded forecast file
-                                # rather than using API calls for no reason
-                                dev_forecast_file = extras_dict[
-                                    "current_conditions_dev_file"
-                                ]
-                                req = Request(
-                                    dev_forecast_file,
-                                    None,
-                                    HTTP_HEADERS["AERIS_WEATHER"],
-                                )
-                                with urlopen(
-                                    req, timeout=DEFAULT_HTTP_TIMEOUT
-                                ) as response:
-                                    forecast_file_result = response.read()
-                                current_payload = _parse_aeris_json(forecast_file_result)
-                                if current_payload.get("schema") == "belchertown.current.v1":
-                                    current_payload["units"] = forecast_units
-                                    forecast_file_result = json.dumps(current_payload)
-                                else:
-                                    forecast_file_result = json.dumps(
-                                        _aeris_current_to_common(
+                        current_conditions_result = None
+                        current_conditions_retry_suppressed = False
+                        retry_delay = 0
+                        if "current_conditions_dev_file" not in extras_dict:
+                            retry_delay = _provider_retry_delay(
+                                forecast_provider,
+                                failure_kind="current_conditions",
+                            )
+                        if retry_delay:
+                            current_conditions_retry_suppressed = True
+                            log.debug(
+                                "Xweather current-conditions update skipped; previous "
+                                "failure cooldown has %s seconds remaining.",
+                                retry_delay,
+                            )
+                        else:
+                            try:
+                                if "current_conditions_dev_file" in extras_dict:
+                                    # Hidden option to use pre-downloaded current data.
+                                    dev_forecast_file = extras_dict[
+                                        "current_conditions_dev_file"
+                                    ]
+                                    req = Request(
+                                        dev_forecast_file,
+                                        None,
+                                        HTTP_HEADERS["AERIS_WEATHER"],
+                                    )
+                                    with urlopen(req, timeout=15) as response:
+                                        dev_current_page = response.read()
+                                    current_payload = _parse_aeris_json(dev_current_page)
+                                    if (
+                                        current_payload.get("schema")
+                                        == "belchertown.current.v1"
+                                    ):
+                                        current_payload["units"] = forecast_units
+                                        normalized_current = current_payload
+                                    else:
+                                        normalized_current = _aeris_current_to_common(
                                             current_payload,
                                             current_conditions,
                                             forecast_units,
                                             label_dict,
                                             aeris_icon_map,
                                         )
+                                    _validate_normalized_current_conditions(
+                                        normalized_current
                                     )
-                            else:
-                                # Current conditions
-                                if current_conditions == "obs":
-                                    req = Request(
-                                        current_obs_url,
-                                        None,
-                                        HTTP_HEADERS["AERIS_WEATHER"],
+                                    current_conditions_result = json.dumps(
+                                        normalized_current
                                     )
-                                    with urlopen(
-                                        req, timeout=DEFAULT_HTTP_TIMEOUT
-                                    ) as response:
-                                        current_page = response.read()
-                                    if belchertown_debug > 1:
-                                        log.info(f"Obs URL: {current_obs_url}")
-                                elif current_conditions == "conds":
-                                    req = Request(
-                                        current_conds_url,
-                                        None,
-                                        HTTP_HEADERS["AERIS_WEATHER"],
-                                    )
-                                    with urlopen(
-                                        req, timeout=DEFAULT_HTTP_TIMEOUT
-                                    ) as response:
-                                        current_page = response.read()
-                                    if belchertown_debug > 1:
-                                        log.info(f"Conditions URL: {current_conds_url}")
-                                else:  # current_conditions == "obs-on-fail-conds":
-                                    req = Request(
-                                        current_obs_url,
-                                        None,
-                                        HTTP_HEADERS["AERIS_WEATHER"],
-                                    )
-                                    with urlopen(
-                                        req, timeout=DEFAULT_HTTP_TIMEOUT
-                                    ) as response:
-                                        current_page = response.read()
-                                    try:  # Obs okay?
-                                        obs_payload = _parse_aeris_json(current_page)
-                                        if not (
-                                            isinstance(obs_payload.get("response"), dict)
-                                            and obs_payload["response"].get("ob")
-                                        ):
-                                            raise ValueError("No usable observation data")
-                                    except Exception:  # Nope, try Conds
-                                        if belchertown_debug > 0:
-                                            log.info("No good Obs data, using Conds")
+                                else:
+                                    # Current conditions
+                                    if current_conditions == "obs":
+                                        req = Request(
+                                            current_obs_url,
+                                            None,
+                                            HTTP_HEADERS["AERIS_WEATHER"],
+                                        )
+                                        with urlopen(req, timeout=15) as response:
+                                            current_page = response.read()
+                                        if belchertown_debug > 1:
+                                            log.info(
+                                                "Xweather observations requested for %s",
+                                                forecast_place,
+                                            )
+                                    elif current_conditions == "conds":
                                         req = Request(
                                             current_conds_url,
                                             None,
                                             HTTP_HEADERS["AERIS_WEATHER"],
                                         )
-                                        with urlopen(
-                                            req, timeout=DEFAULT_HTTP_TIMEOUT
-                                        ) as response:
+                                        with urlopen(req, timeout=15) as response:
                                             current_page = response.read()
-                                # Stash in a file
-                                data = {
-                                    "timestamp": int(time.time()),
-                                    "current": [_parse_aeris_json(current_page)],
-                                }
-                                forecast_file_result = json.dumps(
-                                    _aeris_current_to_common(
+                                        if belchertown_debug > 1:
+                                            log.info(
+                                                "Xweather conditions requested for %s",
+                                                forecast_place,
+                                            )
+                                    else:  # obs-on-fail-conds
+                                        req = Request(
+                                            current_obs_url,
+                                            None,
+                                            HTTP_HEADERS["AERIS_WEATHER"],
+                                        )
+                                        with urlopen(req, timeout=15) as response:
+                                            current_page = response.read()
+                                        try:
+                                            obs_payload = _parse_aeris_json(current_page)
+                                            _aeris_current_data(obs_payload, "obs")
+                                        except Exception as obs_error:
+                                            if belchertown_debug > 0:
+                                                log.info(
+                                                    "No usable Xweather observation; "
+                                                    "using conditions. Reason: %s",
+                                                    obs_error,
+                                                )
+                                            req = Request(
+                                                current_conds_url,
+                                                None,
+                                                HTTP_HEADERS["AERIS_WEATHER"],
+                                            )
+                                            with urlopen(req, timeout=15) as response:
+                                                current_page = response.read()
+
+                                    data = {
+                                        "timestamp": int(time.time()),
+                                        "current": [_parse_aeris_json(current_page)],
+                                    }
+                                    normalized_current = _aeris_current_to_common(
                                         data,
                                         current_conditions,
                                         forecast_units,
                                         label_dict,
                                         aeris_icon_map,
                                     )
-                                )
-                        except Exception as e:
-                            if current_conditions == "obs":
+                                    _validate_normalized_current_conditions(
+                                        normalized_current
+                                    )
+                                    current_conditions_result = json.dumps(
+                                        normalized_current
+                                    )
+                            except Exception as e:
+                                if "current_conditions_dev_file" not in extras_dict:
+                                    _record_provider_failure(
+                                        forecast_provider,
+                                        failure_kind="current_conditions",
+                                    )
                                 log.error(
-                                    "Error downloading forecast Current Conditions data. "
-                                    "Check the URL in your configuration and try again. "
-                                    f"You are trying to use URL: {current_obs_url}, "
-                                    f"and the error is: {e}"
-                                )
-                            elif current_conditions == "conds":
-                                log.error(
-                                    "Error downloading forecast Current Conditions data. "
-                                    "Check the URL in your configuration and try again. "
-                                    f"You are trying to use URL: {current_conds_url}, "
-                                    f"and the error is: {e}"
-                                )
-                            elif current_conditions == "obs-on-fail-conds":
-                                log.error(
-                                    "Error downloading forecast Current Conditions data. "
-                                    "Check the URL in your configuration and try again. "
-                                    f"You are trying to use URL: {current_conds_url}, "
-                                    f"and the error is: {e}"
+                                    "Xweather current-conditions update failed for %s "
+                                    "at %s: %s",
+                                    current_conditions,
+                                    forecast_place,
+                                    e,
                                 )
 
                         # Save forecast Current Conditions data to file. w+ creates the file if it doesn't
                         # exist, and truncates the file and re-writes it everytime
-                        if forecast_file_result is not None:
+                        if current_conditions_result is not None:
                             try:
                                 with open(current_conditions_file, "wb+") as file:
-                                    file.write(forecast_file_result.encode("utf-8"))
+                                    file.write(current_conditions_result.encode("utf-8"))
                                     log.info(
                                         f"New forecast Current Conditions file downloaded to {current_conditions_file}"
+                                    )
+                                    _clear_provider_failure(
+                                        forecast_provider,
+                                        failure_kind="current_conditions",
                                     )
                             except FileNotFoundError:
                                 log.info(
@@ -6380,7 +7325,7 @@ class getData(SearchList):
                                 )
                             except Exception as e:
                                 log.error(f"Current Conditions error: {e}")
-                        else:
+                        elif not current_conditions_retry_suppressed:
                             log.info(
                                 "Current conditions download failed; keeping existing current conditions file if present."
                             )
@@ -6481,7 +7426,7 @@ class getData(SearchList):
                     user_agent = "Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_4; en-US) AppleWebKit/534.3 (KHTML, like Gecko) Chrome/6.0.472.63 Safari/534.3"
                     headers = {"User-Agent": user_agent}
                     req = Request(earthquake_url, None, headers)
-                    with urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT) as response:
+                    with urlopen(req, timeout=15) as response:
                         page = response.read()
                     if weewx.debug:
                         log.debug(
@@ -6806,6 +7751,11 @@ class getData(SearchList):
                         "<span class='outHumAbs'>%s</span>" % humabs_val
                     )
                     row_parts.append(obs_humabs_output)
+                    humabs_meta = _unit_switch_station_observation_meta(
+                        "outHumAbs", humabs_val
+                    )
+                    if humabs_meta:
+                        station_obs_unit_json.setdefault("outHumAbs", humabs_meta)
             row_parts.append("</td>")
             row_parts.append("</tr>")
             station_obs_parts.append("".join(row_parts))
@@ -6818,6 +7768,16 @@ class getData(SearchList):
 
         all_obs_rounding_json = OrderedDict()
         all_obs_unit_labels_json = OrderedDict()
+        configured_unit_names_by_kind = OrderedDict()
+        configured_unit_labels_by_kind = OrderedDict()
+        for obs_group, unit_kind in UNIT_SWITCH_GROUP_KINDS.items():
+            configured_unit = self.generator.converter.group_unit_dict.get(obs_group)
+            if not configured_unit:
+                continue
+            configured_unit_names_by_kind[unit_kind] = configured_unit
+            configured_unit_labels_by_kind[unit_kind] = (
+                self.generator.formatter.get_label_string(configured_unit)
+            )
         for obs in sorted(weewx.units.obs_group_dict):
             try:
                 # Find the unit from group (like group_temperature = degree_F)
@@ -6947,9 +7907,93 @@ class getData(SearchList):
             if not minify_deps_ok:
                 _log_minifier_missing_error_once(missing_modules)
 
+        charts_page_all_button_label = label_generic_dict.get(
+            "charts_page_all_button", label_dict["charts_page_all_button"]
+        )
+        charts_range_selector_labels = OrderedDict(
+            [
+                (
+                    "zoom",
+                    label_generic_dict.get("charts_range_selector_zoom_label", "Zoom"),
+                ),
+                (
+                    "day",
+                    label_generic_dict.get("charts_range_selector_1d_button", "1d"),
+                ),
+                (
+                    "week",
+                    label_generic_dict.get("charts_range_selector_1w_button", "1w"),
+                ),
+                (
+                    "month",
+                    label_generic_dict.get("charts_range_selector_1m_button", "1m"),
+                ),
+                (
+                    "three_months",
+                    label_generic_dict.get("charts_range_selector_3m_button", "3m"),
+                ),
+                (
+                    "ytd",
+                    label_generic_dict.get("charts_range_selector_ytd_button", "YTD"),
+                ),
+                (
+                    "year",
+                    label_generic_dict.get("charts_range_selector_1y_button", "1y"),
+                ),
+                ("all", charts_page_all_button_label),
+            ]
+        )
+        charts_range_selector_titles = OrderedDict(
+            [
+                (
+                    "day",
+                    label_generic_dict.get(
+                        "charts_range_selector_1d_title", "View 1 day"
+                    ),
+                ),
+                (
+                    "week",
+                    label_generic_dict.get(
+                        "charts_range_selector_1w_title", "View 1 week"
+                    ),
+                ),
+                (
+                    "month",
+                    label_generic_dict.get(
+                        "charts_range_selector_1m_title", "View 1 month"
+                    ),
+                ),
+                (
+                    "three_months",
+                    label_generic_dict.get(
+                        "charts_range_selector_3m_title", "View 3 months"
+                    ),
+                ),
+                (
+                    "ytd",
+                    label_generic_dict.get(
+                        "charts_range_selector_ytd_title", "View year to date"
+                    ),
+                ),
+                (
+                    "year",
+                    label_generic_dict.get(
+                        "charts_range_selector_1y_title", "View 1 year"
+                    ),
+                ),
+                (
+                    "all",
+                    label_generic_dict.get(
+                        "charts_range_selector_all_title", "View all"
+                    ),
+                ),
+            ]
+        )
+        highcharts_lang = _highcharts_lang_options(skin_dict)
+
         # Build the search list with the new values
         search_list_extension = {
-            "belchertown_version": VERSION,
+            "belchertown_version": "2.1beta4",
             "asset_suffix": asset_suffix,
             "belchertown_debug": belchertown_debug,
             "moment_js_utc_offset": moment_js_utc_offset,
@@ -7003,6 +8047,10 @@ class getData(SearchList):
             "at_rainiest_day_raw": at_rainiest_day_raw,
             "week_windrun_maxsum": week_windrun_maxsum,
             "week_windrun_maxsum_raw": week_windrun_maxsum_raw,
+            "month_windrun_maxsum": month_windrun_maxsum,
+            "month_windrun_maxsum_raw": month_windrun_maxsum_raw,
+            "year_windrun_maxsum_raw": year_windrun_maxsum_raw,
+            "at_windrun_maxsum_raw": at_windrun_maxsum_raw,
             "sunniest_day": sunniest_day,
             "at_sunniest_day": at_sunniest_day,
             "year_rainiest_month": year_rainiest_month,
@@ -7030,11 +8078,7 @@ class getData(SearchList):
             "at_days_with_rain": at_days_with_rain,
             "at_days_without_rain": at_days_without_rain,
             "windSpeedUnitLabel": windSpeed_unit_label,
-            "noaa_header_html": noaa_header_html,
-            "default_noaa_file": default_noaa_file,
-            "default_noaa_file_json": json.dumps(default_noaa_file),
-            "available_noaa_files_json": json.dumps(sorted(noaa_file_list)),
-            "noaa_relative_dir_json": json.dumps(noaa_relative_dir),
+            **noaa_search_list_values,
             "current_obs_icon": current_obs_icon,
             "current_obs_summary": current_obs_summary,
             "visibility": visibility,
@@ -7046,6 +8090,12 @@ class getData(SearchList):
             "station_obs_html": station_obs_html,
             "all_obs_rounding_json": json.dumps(all_obs_rounding_json),
             "all_obs_unit_labels_json": json.dumps(all_obs_unit_labels_json),
+            "configured_unit_names_by_kind_json": json.dumps(
+                configured_unit_names_by_kind
+            ),
+            "configured_unit_labels_by_kind_json": json.dumps(
+                configured_unit_labels_by_kind
+            ),
             "earthquake_time": eqtime,
             "earthquake_url": equrl,
             "earthquake_place": eqplace,
@@ -7071,14 +8121,17 @@ class getData(SearchList):
             "homepage_charts_link_label": label_generic_dict.get(
                 "homepage_charts_link", label_dict["homepage_charts_link"]
             ),
-            "charts_page_all_button_label": label_generic_dict.get(
-                "charts_page_all_button", label_dict["charts_page_all_button"]
-            ),
+            "charts_page_all_button_label": charts_page_all_button_label,
             "charts_page_all_button_label_json": json.dumps(
-                label_generic_dict.get(
-                    "charts_page_all_button", label_dict["charts_page_all_button"]
-                )
+                charts_page_all_button_label
             ),
+            "charts_range_selector_labels_json": json.dumps(
+                charts_range_selector_labels
+            ),
+            "charts_range_selector_titles_json": json.dumps(
+                charts_range_selector_titles
+            ),
+            "highcharts_lang_json": json.dumps(highcharts_lang),
             "charts_windrose_frequency_label": label_generic_dict.get(
                 "charts_windrose_frequency", label_dict["charts_windrose_frequency"]
             ),
@@ -7107,6 +8160,13 @@ class getData(SearchList):
                 str(extras_dict.get("mqtt_websockets_password", ""))
             ),
         }
+        # TimespanBinder varies by template, while NOAA files can appear as the
+        # report generates. Cache everything else for this report run.
+        self._shared_search_list_extension = dict(search_list_extension)
+        self._shared_html_root = html_root
+        for key in self.NOAA_SEARCH_LIST_KEYS + ("alltime",):
+            self._shared_search_list_extension.pop(key, None)
+
         # Finally, return our extension as a list:
         return [search_list_extension]
 
@@ -7400,7 +8460,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             )  # This retains the order in which to load the charts on the page.
             chart_options = accumulateLeaves(self.chart_dict[chart_group])
 
-            output[chart_group]["belchertown_version"] = VERSION
+            output[chart_group]["belchertown_version"] = "2.1beta4"
             output[chart_group]["generated_timestamp"] = generated_timestamp
 
             # Setup the JSON file name for each chart group
@@ -7414,7 +8474,11 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             output[chart_group]["colors"] = colors
 
             # chartgroup_title is used on the charts page
-            chartgroup_title = chart_options.get("title", None)
+            chartgroup_title = _resolve_chart_label_text(
+                chart_options.get("title", None),
+                d,
+                f"[{chart_group}] title",
+            )
             if chartgroup_title:
                 output[chart_group]["chartgroup_title"] = chartgroup_title
 
@@ -7423,7 +8487,11 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             output[chart_group]["tooltip_date_format"] = tooltip_date_format
 
             # Credits Text
-            credits = chart_options.get("credits", "highcharts_default")
+            credits = _resolve_chart_label_text(
+                chart_options.get("credits", "highcharts_default"),
+                d,
+                f"[{chart_group}] credits",
+            )
             output[chart_group]["credits"] = credits
 
             # Credits URL
@@ -7520,10 +8588,18 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
                     if not plotgen_ts:
                         plotgen_ts = time.time()
 
-                chart_title = plot_options.get("title", "")
+                chart_title = _resolve_chart_label_text(
+                    plot_options.get("title", ""),
+                    d,
+                    f"[{chart_group}][{plotname}] title",
+                )
                 output[chart_group][plotname]["options"]["title"] = chart_title
 
-                chart_subtitle = plot_options.get("subtitle", "")
+                chart_subtitle = _resolve_chart_label_text(
+                    plot_options.get("subtitle", ""),
+                    d,
+                    f"[{chart_group}][{plotname}] subtitle",
+                )
                 output[chart_group][plotname]["options"]["subtitle"] = chart_subtitle
 
                 # Get the type of plot ("bar', 'line', 'spline', or 'scatter')
@@ -7562,6 +8638,11 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
                 # it into a list
                 if not isinstance(xAxis_categories, list):
                     xAxis_categories = xAxis_categories.split()
+                xAxis_categories = _resolve_chart_label_text(
+                    xAxis_categories,
+                    d,
+                    f"[{chart_group}][{plotname}] xAxis_categories",
+                )
                 output[chart_group][plotname]["options"][
                     "xAxis_categories"
                 ] = xAxis_categories
@@ -7826,6 +8907,11 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
 
                     # Get any custom names for this observation
                     name = line_options.get("name", None)
+                    name = _resolve_chart_label_text(
+                        name,
+                        d,
+                        f"[{chart_group}][{plotname}][{line_name}] name",
+                    )
                     if not name:
                         # No explicit name. Look up a generic one. NB:
                         # label_dict is a KeyDict which will substitute the key
@@ -7875,20 +8961,30 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
                     else:
                         wind_obs = "windSpeed"
                         obs_label = observation_type
-                    unit_label = line_options.get(
-                        "yAxis_label_unit",
-                        self.formatter.get_label_string(
+                    unit_label_config = line_options.get("yAxis_label_unit", None)
+                    if unit_label_config is not None:
+                        unit_label = _resolve_chart_label_text(
+                            unit_label_config,
+                            d,
+                            f"[{chart_group}][{plotname}][{line_name}] yAxis_label_unit",
+                        )
+                    else:
+                        unit_label = self.formatter.get_label_string(
                             special_target_unit
                             if special_target_unit
                             else self.converter.getTargetUnit(
                                 obs_label, aggregate_type
                             )[0]
-                        ),
-                    )
+                        )
 
                     # Set the yAxis label. Place into series for custom
                     # JavaScript. Highcharts will ignore these by default
                     yAxisLabel_config = line_options.get("yAxis_label", None)
+                    yAxisLabel_config = _resolve_chart_label_text(
+                        yAxisLabel_config,
+                        d,
+                        f"[{chart_group}][{plotname}][{line_name}] yAxis_label",
+                    )
                     # Set a default yAxis label if charts.conf yAxis_label is
                     # none and there's a unit_label - e.g. Temperature (F)
                     if yAxisLabel_config is None and unit_label:
@@ -7950,6 +9046,12 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
                     for highcharts_config, highcharts_value in self.chart_dict[
                         chart_group
                     ][plotname][line_name].items():
+                        if highcharts_config in CHART_TEXT_SERIES_OPTIONS:
+                            highcharts_value = _resolve_chart_label_text(
+                                highcharts_value,
+                                d,
+                                f"[{chart_group}][{plotname}][{line_name}] {highcharts_config}",
+                            )
                         output[chart_group][plotname]["series"][line_name][
                             highcharts_config
                         ] = highcharts_value

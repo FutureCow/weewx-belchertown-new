@@ -145,11 +145,16 @@
             belchertown_set_text(".updated", updated_text);
 
             // #if $Extras.has_key('earthquake_enabled') and $Extras.earthquake_enabled == '1'            
-            if (dayjs.unix("$earthquake_time").isValid()) {
+            if (typeof renderEarthquakeData === "function" && typeof weewx_data === "object" && weewx_data) {
+                renderEarthquakeData(weewx_data);
+            } else if (dayjs.unix("$earthquake_time").isValid()) {
                 // Check that the time is the time (number) and not the "no earthquake available" wording
                 belchertown_set_text(".earthquake-time", tzAdjustedMoment("$earthquake_time").format(belchertown_label_text("$obs.label.time_earthquake")));
             } else {
                 belchertown_set_text(".earthquake-time", belchertown_label_text("$earthquake_time"));
+            }
+            if (typeof belchertown_start_earthquake_refresh_timer === "function") {
+                belchertown_start_earthquake_refresh_timer("$Extras.earthquake_stale");
             }
             // #end if
 
@@ -181,13 +186,13 @@
                 connect(); // Begin mqtt after WeeWX initial load
             }
 
-            // #if $Extras.has_key("reload_hook_images") and $Extras.reload_hook_images == '1'
-            // Update any images in the radar section or hooks
-
             // #if $Extras.has_key("reload_images_radar") and $Extras.reload_images_radar != '-1'
             var reload_radar_timer = $Extras.reload_images_radar * 1000; // convert to millis
             setTimeout(function() {ajaximages("radar", $Extras.reload_images_radar);}, reload_radar_timer);
             // #end if
+
+            // #if $Extras.has_key("reload_hook_images") and $Extras.reload_hook_images == '1'
+            // Update any images in the hooks
 
             // #if $Extras.has_key("reload_images_hook_asi") and $Extras.reload_images_hook_asi != '-1'
             var reload_asi_timer = $Extras.reload_images_hook_asi * 1000; // convert to millis
@@ -321,7 +326,7 @@
                                         </div>
                                         #if $Extras.has_key("aqi_enabled") and $Extras.aqi_enabled == '1'
                                         <div class="aqi_outer">
-                                            $obs.label.aqi: <span class="wx-aqi">$aqi</span> (<span class="wx-aqi-category">$aqi_category</span>)
+                                            $obs.label.aqi: <span class="wx-aqi">$aqi</span> <span class="wx-aqi-category">$aqi_category</span>
                                             #if $Extras.has_key("aqi_location_enabled") and $Extras.aqi_location_enabled == '1'
                                             <span class="aqi_location_outer"><br>$aqi_location</span>
                                             #end if
