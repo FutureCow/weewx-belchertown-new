@@ -2397,9 +2397,11 @@ p.entry-meta {
   text-align: center !important;
 }
 
-.wind-table tr:first-child td:nth-child(1) { width: 33%; }
-.wind-table tr:first-child td:nth-child(2) { width: 45%; }
-.wind-table tr:first-child td:nth-child(3) { width: 22%; }
+/* Alleen bij 3 kolommen (beaufort_number = 1). Bij 2 kolommen grijpen deze
+   selectors niet en valt de tabel terug op een gelijke 50/50-verdeling. */
+.wind-table tr:first-child td:first-child:nth-last-child(3) { width: 33%; }
+.wind-table tr:first-child td:first-child:nth-last-child(3) ~ td:nth-child(2) { width: 45%; }
+.wind-table tr:first-child td:first-child:nth-last-child(3) ~ td:nth-child(3) { width: 22%; }
 
 .windtext {
   font-size: 16px;
@@ -2418,6 +2420,8 @@ p.entry-meta {
   height: auto;
   font-size: 16px !important;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .homepage-card--wind .current_wind > .col-md-6 {
@@ -2426,7 +2430,7 @@ p.entry-meta {
   width: 42% !important;
 }
 
-.homepage-card--wind .current_wind > .windspeedtable {
+.homepage-card--wind .current_wind > .col-md-6.windspeedtable {
   flex: 0 0 58% !important;
   max-width: 58% !important;
   width: 58% !important;
@@ -3724,8 +3728,6 @@ table.celestial td.label {
 
 .frontpage .homepage-card--wind .wind-table {
   margin: 0 auto;
-  width: 100%;
-  table-layout: fixed;
 }
 
 .frontpage .homepage-card--radar {
