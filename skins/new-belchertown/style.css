@@ -7616,3 +7616,41 @@ body.dark {
 .offcanvas-settings .themeModeButton { flex: 1 1 0; }
 .offcanvas-settings .unitSwitcherButtons { width: 100%; }
 .offcanvas-settings .unitSwitcherButton { flex: 1 1 30%; }
+
+/* ---------------------------------------------------------------------------
+   Radarpagina (/radar/): de vier panelen staan daar als losse inline-elementen
+   in de markup. Inline betekent uitlijning op de tekstregel, en omdat de skin
+   `vertical-align: middle` op img zet terwijl de iframe op `baseline` blijft,
+   verspringen ze onderling ruim 200px. Als raster met block-panelen speelt dat
+   niet meer. Vereist de wrapper <div class="radar-grid"> om de panelen heen.
+   --------------------------------------------------------------------------- */
+
+.radar-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 425px));
+  justify-content: start;
+  align-items: start;
+  gap: 16px;
+  margin: 16px 0;
+}
+
+.radar-grid > img,
+.radar-grid > iframe {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+}
+
+/* Een iframe heeft geen intrinsieke beeldverhouding zoals een img, dus die
+   geven we hem expliciet mee -- anders klapt hij dicht zonder height-attribuut. */
+.radar-grid > iframe {
+  aspect-ratio: 425 / 445;
+  border: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+@media (max-width: 940px) {
+  .radar-grid { grid-template-columns: minmax(0, 425px); }
+}
