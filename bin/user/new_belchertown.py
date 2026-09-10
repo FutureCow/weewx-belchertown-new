@@ -55,8 +55,10 @@ if weewx.__version__ < "5":
 
 log = logging.getLogger(__name__)
 
+VERSION = "2.1.1"
+
 # Print version in syslog for easier troubleshooting
-log.info("version 2.1beta4")
+log.info("version %s", VERSION)
 
 HIGHCHARTS_LANG_DEFAULTS = OrderedDict(
     [
@@ -209,6 +211,28 @@ VALID_AQI_SOURCES = (
     "forecast",
 )
 
+VALID_AQI_SCALES = (
+    "auto",
+    "us",
+    "european",
+    "canada",
+    "uk",
+)
+
+CANADIAN_TIMEZONES = frozenset(
+    (
+        "america/atikokan", "america/blanc-sablon", "america/cambridge_bay",
+        "america/creston", "america/dawson", "america/dawson_creek",
+        "america/edmonton", "america/fort_nelson", "america/glace_bay",
+        "america/goose_bay", "america/halifax", "america/inuvik",
+        "america/iqaluit", "america/moncton", "america/nipigon",
+        "america/rainy_river", "america/regina", "america/resolute",
+        "america/st_johns", "america/swift_current", "america/thunder_bay",
+        "america/toronto", "america/vancouver", "america/whitehorse",
+        "america/winnipeg",
+    )
+)
+
 VALID_FORECAST_UNITS = (
     "us",
     "si",
@@ -313,6 +337,54 @@ PM25_AQI_BREAKPOINTS = (
     (125.5, 225.4, 201, 300),
     (225.5, 325.4, 301, 500),
 )
+
+# European AQI breakpoints from the European Environment Agency. The index is
+# interpolated within each category; values beyond the final threshold keep the
+# final interval's slope so the index can exceed 100.
+EUROPEAN_AQI_BREAKPOINTS = {
+    "pm2.5": (
+        (0.0, 5.0, 0, 20),
+        (5.0, 15.0, 20, 40),
+        (15.0, 50.0, 40, 60),
+        (50.0, 90.0, 60, 80),
+        (90.0, 140.0, 80, 100),
+    ),
+    "pm10": (
+        (0.0, 15.0, 0, 20),
+        (15.0, 45.0, 20, 40),
+        (45.0, 120.0, 40, 60),
+        (120.0, 195.0, 60, 80),
+        (195.0, 270.0, 80, 100),
+    ),
+    "no2": (
+        (0.0, 10.0, 0, 20),
+        (10.0, 25.0, 20, 40),
+        (25.0, 60.0, 40, 60),
+        (60.0, 100.0, 60, 80),
+        (100.0, 150.0, 80, 100),
+    ),
+    "o3": (
+        (0.0, 60.0, 0, 20),
+        (60.0, 100.0, 20, 40),
+        (100.0, 120.0, 40, 60),
+        (120.0, 160.0, 60, 80),
+        (160.0, 180.0, 80, 100),
+    ),
+    "so2": (
+        (0.0, 20.0, 0, 20),
+        (20.0, 40.0, 20, 40),
+        (40.0, 125.0, 40, 60),
+        (125.0, 190.0, 60, 80),
+        (190.0, 275.0, 80, 100),
+    ),
+}
+
+EUROPEAN_AQI_POLLUTANT_ALIASES = {
+    "pm2_5": "pm2.5",
+    "nitrogen_dioxide": "no2",
+    "ozone": "o3",
+    "sulphur_dioxide": "so2",
+}
 
 DEFAULT_DIRECTION_LABELS = [
     "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
@@ -742,10 +814,106 @@ def _normalize_aqi_source(aqi_source):
     return "auto"
 
 
+def _normalize_aqi_scale(aqi_scale):
+    """Normalize the configured AQI scale selection."""
+    scale_key = str(aqi_scale or "").strip().lower()
+    if scale_key in VALID_AQI_SCALES:
+        return scale_key
+
+    log.warning(
+        "Invalid aqi_scale '%s'. Valid values are: %s. Falling back to 'auto'.",
+        aqi_scale,
+        ", ".join(VALID_AQI_SCALES),
+    )
+    return "auto"
+
+
+def _aqi_scale_from_meteoalarm_country(country_slug):
+    """Map a resolved MeteoAlarm country slug to its AQI scale."""
+    if country_slug == "united-kingdom":
+        return "uk"
+    return "european" if country_slug else ""
+
+
+def _auto_aqi_scale(timezone_value, extras_dict=None):
+    """Choose an AQI scale from forecast/alert location data, then timezone."""
+    extras_dict = extras_dict or {}
+    for country_slug in (
+        _meteoalarm_country_slug(extras_dict.get("meteoalarm_country")),
+        _meteoalarm_country_slug_from_geocode(
+            extras_dict.get("meteoalarm_geocode")
+        ),
+    ):
+        resolved_scale = _aqi_scale_from_meteoalarm_country(country_slug)
+        if resolved_scale:
+            log.debug(
+                "AQI scale auto-selected '%s' from alert location '%s'.",
+                resolved_scale,
+                country_slug,
+            )
+            return resolved_scale
+
+    forecast_place = str(extras_dict.get("forecast_place", "")).strip().upper()
+    if forecast_place.rsplit(",", 1)[-1].strip() in ("CA", "CANADA"):
+        log.debug("AQI scale auto-selected 'canada' from forecast location '%s'.", forecast_place)
+        return "canada"
+    if forecast_place.rsplit(",", 1)[-1].strip() in ("GB", "UK"):
+        log.debug("AQI scale auto-selected 'uk' from forecast location '%s'.", forecast_place)
+        return "uk"
+    forecast_country = forecast_place.rsplit(",", 1)[-1].strip()
+    if forecast_country in METEOALARM_COUNTRY_SLUG_BY_CODE:
+        resolved_scale = _aqi_scale_from_meteoalarm_country(
+            METEOALARM_COUNTRY_SLUG_BY_CODE[forecast_country]
+        )
+        if resolved_scale:
+            log.debug(
+                "AQI scale auto-selected '%s' from forecast location '%s'.",
+                resolved_scale, forecast_place,
+            )
+            return resolved_scale
+
+    timezone_values = _config_list_values(timezone_value)
+    if not timezone_values:
+        timezone_values = _system_timezone_values()
+    timezone_key = timezone_values[0].lower() if timezone_values else ""
+    if timezone_key in CANADIAN_TIMEZONES:
+        log.debug("AQI scale auto-selected 'canada' from location timezone '%s'.", timezone_key)
+        return "canada"
+    if timezone_key in ("europe/london", "gmt", "bst"):
+        log.debug("AQI scale auto-selected 'uk' from location timezone '%s'.", timezone_key)
+        return "uk"
+    if (
+        timezone_key.startswith("europe/")
+        or timezone_key in ("cet", "cest", "eet", "eest", "wet", "west")
+        or _meteoalarm_country_slug_from_timezone(timezone_key)
+    ):
+        log.debug("AQI scale auto-selected 'european' from location timezone '%s'.", timezone_key)
+        return "european"
+    log.debug("AQI scale auto-selected 'us'; no location-specific scale was resolved.")
+    return "us"
+
+
+def _system_timezone_values():
+    """Return the host IANA timezone when the report does not configure one."""
+    candidates = [os.environ.get("TZ")]
+    try:
+        candidates.append(getattr(datetime.datetime.now().astimezone().tzinfo, "key", None))
+    except Exception:
+        pass
+    try:
+        localtime_path = os.path.realpath("/etc/localtime")
+        marker = "/zoneinfo/"
+        if marker in localtime_path:
+            candidates.append(localtime_path.split(marker, 1)[1])
+    except OSError:
+        pass
+    return [str(value).strip() for value in candidates if value and str(value).strip()]
+
+
 def _aqi_forecast_provider_for_forecast_provider(forecast_provider):
     """Return the AQI provider used by a forecast provider, if any."""
     provider_key = _canonical_forecast_provider(forecast_provider)
-    if provider_key in ("nws", "open-meteo"):
+    if provider_key in ("nws", "open-meteo", "pirateweather"):
         return "open-meteo"
     if provider_key == "aeris":
         return "aeris"
@@ -1815,6 +1983,15 @@ def _station_observation_entries(station_observations):
     ]
 
 
+def _aqi_data_is_requested(extras_dict, station_observations):
+    """Return whether any configured homepage or kiosk element needs AQI data."""
+    return (
+        to_bool(extras_dict.get("aqi_enabled", "0"))
+        or to_bool(extras_dict.get("aqi_enabled_kiosk", "0"))
+        or any(obs == "aqi" for obs, _binding in station_observations)
+    )
+
+
 UNIT_SWITCH_GROUP_KINDS = {
     "group_temperature": "temp",
     "group_pressure": "press",
@@ -2165,6 +2342,7 @@ def _nws_transform_to_belch(
     observation_payload,
     alerts_payload,
     forecast_units,
+    location_timezone="",
 ):
     """Map NWS responses to the compact structure this skin uses."""
     hourly_all = _nws_build_hourly(hourly_payload, forecast_units)
@@ -2185,6 +2363,7 @@ def _nws_transform_to_belch(
         "daily": _nws_build_daily(forecast_payload, forecast_units),
         "alerts": _nws_build_alerts(alerts_payload),
         "provider": "nws",
+        "location_timezone": location_timezone or "",
         "units": forecast_units,
         "schema": "belchertown.forecast.v1",
         "generated_at": int(time.time()),
@@ -2241,6 +2420,50 @@ def _aqi_category_from_us_aqi(aqi_value):
     return "hazardous"
 
 
+def _aqi_category_from_european_aqi(aqi_value):
+    """Return the European AQI category key for a numeric AQI value."""
+    aqi_float = _safe_float(aqi_value)
+    if aqi_float is None:
+        return ""
+    if aqi_float <= 20:
+        return "good"
+    if aqi_float <= 40:
+        return "fair"
+    if aqi_float <= 60:
+        return "moderate"
+    if aqi_float <= 80:
+        return "poor"
+    if aqi_float <= 100:
+        return "very poor"
+    return "extremely poor"
+
+
+def _aqi_category_from_scale(aqi_value, aqi_scale):
+    """Return the category key for a value on the configured AQI scale."""
+    aqi_float = _safe_float(aqi_value)
+    if aqi_float is None:
+        return ""
+    if aqi_scale == "canada":
+        if aqi_float <= 3:
+            return "low"
+        if aqi_float <= 6:
+            return "moderate"
+        if aqi_float <= 10:
+            return "high"
+        return "very high"
+    if aqi_scale == "uk":
+        if aqi_float <= 3:
+            return "low"
+        if aqi_float <= 6:
+            return "moderate"
+        if aqi_float <= 9:
+            return "high"
+        return "very high"
+    if aqi_scale == "european":
+        return _aqi_category_from_european_aqi(aqi_value)
+    return _aqi_category_from_us_aqi(aqi_value)
+
+
 def _truncate_pm25_for_aqi(pm25_value):
     """Return PM2.5 concentration truncated to 0.1 ug/m3 for AQI math."""
     pm25_float = _safe_float(pm25_value)
@@ -2266,7 +2489,113 @@ def _us_aqi_from_pm25(pm25_value):
     return None
 
 
-def _local_aqi_payload(aqi_value, timestamp, method, pm25_value=None):
+def _european_aqi_from_concentration(pollutant, concentration):
+    """Calculate a European AQI from one pollutant concentration in ug/m3."""
+    concentration_float = _safe_float(concentration)
+    if concentration_float is None or concentration_float < 0:
+        return None
+
+    pollutant_key = EUROPEAN_AQI_POLLUTANT_ALIASES.get(pollutant, pollutant)
+    breakpoints = EUROPEAN_AQI_BREAKPOINTS.get(pollutant_key)
+    if not breakpoints:
+        return None
+
+    for c_lo, c_hi, i_lo, i_hi in breakpoints:
+        if c_lo <= concentration_float <= c_hi:
+            return int(
+                round(
+                    ((i_hi - i_lo) / (c_hi - c_lo))
+                    * (concentration_float - c_lo)
+                    + i_lo
+                )
+            )
+
+    c_lo, c_hi, i_lo, i_hi = breakpoints[-1]
+    return int(
+        round(
+            ((i_hi - i_lo) / (c_hi - c_lo))
+            * (concentration_float - c_lo)
+            + i_lo
+        )
+    )
+
+
+def _european_aqi_from_pollutants(pollutants):
+    """Return the highest European AQI calculated from available pollutants."""
+    pollutant_aqis = []
+    for pollutant in pollutants or []:
+        if not isinstance(pollutant, dict):
+            continue
+        aqi_value = _european_aqi_from_concentration(
+            pollutant.get("type"), pollutant.get("valueUGM3")
+        )
+        if aqi_value is not None:
+            pollutant_aqis.append(aqi_value)
+    return max(pollutant_aqis) if pollutant_aqis else None
+
+
+UK_DAQI_BREAKPOINTS = {
+    "pm2.5": (11, 23, 35, 41, 47, 53, 58, 64, 70),
+    "pm10": (16, 33, 50, 58, 66, 75, 83, 91, 100),
+    "no2": (67, 134, 200, 267, 334, 400, 467, 534, 600),
+    "o3": (33, 66, 100, 120, 140, 160, 187, 213, 240),
+    "so2": (88, 177, 266, 354, 443, 532, 710, 887, 1064),
+}
+
+
+def _uk_daqi_from_pollutants(pollutants):
+    """Return the highest UK DAQI sub-index from available concentrations."""
+    indices = []
+    for pollutant in pollutants or []:
+        if not isinstance(pollutant, dict):
+            continue
+        pollutant_type = EUROPEAN_AQI_POLLUTANT_ALIASES.get(
+            pollutant.get("type"), pollutant.get("type")
+        )
+        breakpoints = UK_DAQI_BREAKPOINTS.get(pollutant_type)
+        concentration = _safe_float(pollutant.get("valueUGM3"))
+        if not breakpoints or concentration is None or concentration < 0:
+            continue
+        indices.append(next((i + 1 for i, upper in enumerate(breakpoints) if concentration <= upper), 10))
+    return max(indices) if indices else None
+
+
+def _canadian_aqhi_from_pollutants(pollutants):
+    """Calculate Canada's AQHI from PM2.5, ozone, and nitrogen dioxide."""
+    values = {}
+    for pollutant in pollutants or []:
+        if not isinstance(pollutant, dict):
+            continue
+        pollutant_type = EUROPEAN_AQI_POLLUTANT_ALIASES.get(
+            pollutant.get("type"), pollutant.get("type")
+        )
+        value = _safe_float(pollutant.get("valueUGM3"))
+        if value is not None and value >= 0:
+            values[pollutant_type] = value
+    if not {"pm2.5", "o3", "no2"} <= set(values):
+        return None
+    ozone_ppb = values["o3"] * 24.45 / 48.0
+    no2_ppb = values["no2"] * 24.45 / 46.0
+    aqhi = (1000.0 / 10.4) * (
+        math.exp(0.000537 * ozone_ppb)
+        + math.exp(0.000487 * values["pm2.5"])
+        + math.exp(0.000871 * no2_ppb)
+        - 3.0
+    )
+    return max(1, int(round(aqhi)))
+
+
+def _aqi_value_from_pollutants(pollutants, aqi_scale):
+    if aqi_scale == "european":
+        return _european_aqi_from_pollutants(pollutants)
+    if aqi_scale == "canada":
+        return _canadian_aqhi_from_pollutants(pollutants)
+    if aqi_scale == "uk":
+        return _uk_daqi_from_pollutants(pollutants)
+    return None
+
+
+def _local_aqi_payload(aqi_value, timestamp, method, pm25_value=None, aqi_scale="us"):
     """Return a normalized AQI payload for locally measured air quality."""
     aqi_float = _safe_float(aqi_value)
     if aqi_float is None or aqi_float < 0:
@@ -2294,7 +2623,7 @@ def _local_aqi_payload(aqi_value, timestamp, method, pm25_value=None):
                     {
                         "timestamp": timestamp_int,
                         "aqi": aqi_int,
-                        "category": _aqi_category_from_us_aqi(aqi_int),
+                        "category": _aqi_category_from_scale(aqi_int, aqi_scale),
                         "pollutants": pollutants,
                     }
                 ],
@@ -2302,11 +2631,14 @@ def _local_aqi_payload(aqi_value, timestamp, method, pm25_value=None):
         ],
         "provider": "local-sensor",
         "method": method,
+        "scale": aqi_scale,
     }
 
 
 def _archive_latest_numeric(archive_manager, column_name):
     """Return the latest (timestamp, float value) for a hard-coded archive column."""
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(column_name or "")):
+        return None
     try:
         row = archive_manager.getSql(
             f"SELECT dateTime, {column_name} FROM archive "
@@ -2322,6 +2654,33 @@ def _archive_latest_numeric(archive_manager, column_name):
         return timestamp, value
     except Exception:
         return None
+
+
+def _archive_column_names(archive_manager):
+    """Return archive columns without assuming a database backend."""
+    try:
+        return list(archive_manager.connection.columnsOf("archive"))
+    except Exception:
+        return []
+
+
+def _local_pm25_columns(archive_manager):
+    """Automatically discover PM2.5 archive columns."""
+    columns = _archive_column_names(archive_manager)
+    discovered = [
+        value for value in columns
+        if re.match(r"^pm2_5(?:_aqi)?(?:_[A-Za-z0-9]+)*$", value, re.IGNORECASE)
+    ]
+    return sorted(discovered, key=lambda value: (value != "pm2_5", value))
+
+
+def _fresh_archive_value(archive_manager, column_name, max_age):
+    latest = _archive_latest_numeric(archive_manager, column_name)
+    if latest is None:
+        return None
+    if max_age and int(time.time()) - latest[0] > max_age:
+        return None
+    return latest
 
 
 def _pm25_nowcast_from_hourly(hourly_offsets):
@@ -2344,9 +2703,11 @@ def _pm25_nowcast_from_hourly(hourly_offsets):
     return numerator / denominator
 
 
-def _archive_pm25_nowcast_payload(archive_manager):
-    """Build local AQI from archive PM2.5 using NowCast when possible."""
-    latest = _archive_latest_numeric(archive_manager, "pm2_5")
+def _archive_pm25_nowcast_payload(
+    archive_manager, aqi_scale="us", pm25_column="pm2_5", max_age=7200
+):
+    """Build local AQI from archive PM2.5 using the configured AQI scale."""
+    latest = _fresh_archive_value(archive_manager, pm25_column, max_age)
     if latest is None:
         return None
 
@@ -2355,8 +2716,8 @@ def _archive_pm25_nowcast_payload(archive_manager):
     try:
         rows = list(
             archive_manager.genSql(
-                "SELECT dateTime, pm2_5 FROM archive "
-                "WHERE dateTime >= ? AND dateTime <= ? AND pm2_5 IS NOT NULL "
+                f"SELECT dateTime, {pm25_column} FROM archive "
+                f"WHERE dateTime >= ? AND dateTime <= ? AND {pm25_column} IS NOT NULL "
                 "ORDER BY dateTime DESC",
                 (start_ts, latest_ts),
             )
@@ -2389,10 +2750,41 @@ def _archive_pm25_nowcast_payload(archive_manager):
         hourly_offsets.append((hours_ago, sum(values) / len(values)))
 
     nowcast_pm25 = None
-    if recent_valid_count >= 2:
+    if aqi_scale == "us" and recent_valid_count >= 2:
         nowcast_pm25 = _pm25_nowcast_from_hourly(hourly_offsets)
 
-    if nowcast_pm25 is not None:
+    if aqi_scale == "european":
+        aqi_value = _european_aqi_from_concentration("pm2.5", latest_pm25)
+        method = "pm2_5_european"
+        pm25_value = latest_pm25
+    elif aqi_scale == "uk":
+        aqi_value = _uk_daqi_from_pollutants(
+            [{"type": "pm2.5", "valueUGM3": latest_pm25}]
+        )
+        method = "pm2_5_uk"
+        pm25_value = latest_pm25
+    elif aqi_scale == "canada":
+        suffix = pm25_column[len("pm2_5"):]
+        pollutants = [{"type": "pm2.5", "valueUGM3": latest_pm25}]
+        for pollutant_type, base_names in (
+            ("o3", ("o3", "ozone")),
+            ("no2", ("no2", "nitrogen_dioxide")),
+        ):
+            latest_pollutant = None
+            for base_name in base_names:
+                latest_pollutant = _fresh_archive_value(
+                    archive_manager, base_name + suffix, max_age
+                )
+                if latest_pollutant is not None:
+                    break
+            if latest_pollutant is not None:
+                pollutants.append(
+                    {"type": pollutant_type, "valueUGM3": latest_pollutant[1]}
+                )
+        aqi_value = _canadian_aqhi_from_pollutants(pollutants)
+        method = "local_pollutants_canada"
+        pm25_value = latest_pm25
+    elif nowcast_pm25 is not None:
         aqi_value = _us_aqi_from_pm25(nowcast_pm25)
         method = "pm2_5_nowcast"
         pm25_value = nowcast_pm25
@@ -2403,28 +2795,56 @@ def _archive_pm25_nowcast_payload(archive_manager):
 
     if aqi_value is None:
         return None
-    return _local_aqi_payload(aqi_value, latest_ts, method, pm25_value=pm25_value)
+    return _local_aqi_payload(
+        aqi_value,
+        latest_ts,
+        method,
+        pm25_value=pm25_value,
+        aqi_scale=aqi_scale,
+    )
 
 
-def _archive_local_aqi_payload(archive_manager):
-    """Return archive pm2_5_aqi first, then PM2.5 NowCast/estimate."""
-    latest_aqi = _archive_latest_numeric(archive_manager, "pm2_5_aqi")
-    if latest_aqi is not None:
-        timestamp, aqi_value = latest_aqi
-        latest_pm25 = _archive_latest_numeric(archive_manager, "pm2_5")
-        payload = _local_aqi_payload(
-            aqi_value,
-            timestamp,
-            "pm2_5_aqi",
-            pm25_value=latest_pm25[1] if latest_pm25 is not None else None,
-        )
-        if payload is not None:
-            return payload
+def _archive_local_aqi_payload(
+    archive_manager, aqi_scale="us", max_age=7200
+):
+    """Return the freshest usable AQI/PM2.5 payload from local sensor columns."""
+    columns = _local_pm25_columns(archive_manager)
+    if not columns:
+        columns = ["pm2_5_aqi", "pm2_5"]
+    candidates = []
+    for column in columns:
+        is_aqi = "_aqi" in column.lower()
+        if is_aqi and aqi_scale != "us":
+            continue
+        latest = _fresh_archive_value(archive_manager, column, max_age)
+        if latest is not None:
+            candidates.append((latest[0], column, latest, is_aqi))
+    for _, column, latest, is_aqi in sorted(candidates, reverse=True):
+        if is_aqi:
+            timestamp, aqi_value = latest
+            pm25_column = column.lower().replace("_aqi", "")
+            latest_pm25 = _fresh_archive_value(archive_manager, pm25_column, max_age)
+            payload = _local_aqi_payload(
+                aqi_value,
+                timestamp,
+                column,
+                pm25_value=latest_pm25[1] if latest_pm25 is not None else None,
+                aqi_scale=aqi_scale,
+            )
+            if payload is not None:
+                return payload
+        else:
+            payload = _archive_pm25_nowcast_payload(
+                archive_manager, aqi_scale=aqi_scale,
+                pm25_column=column, max_age=max_age,
+            )
+            if payload is not None:
+                payload["method"] = payload["method"].replace("pm2_5", column, 1)
+                return payload
+    return None
 
-    return _archive_pm25_nowcast_payload(archive_manager)
 
-
-def _openmeteo_air_quality_to_aeris_payload(payload):
+def _openmeteo_air_quality_to_aeris_payload(payload, aqi_scale="us"):
     """Normalize Open-Meteo Air Quality data to the existing AQI fallback shape."""
     current = (payload or {}).get("current") or {}
     current_time = _iso_to_epoch(current.get("time")) or int(time.time())
@@ -2451,11 +2871,14 @@ def _openmeteo_air_quality_to_aeris_payload(payload):
             }
         )
 
-    aqi_value = _safe_float(current.get("us_aqi"))
+    aqi_key = "european_aqi" if aqi_scale == "european" else "us_aqi"
+    aqi_value = _safe_float(current.get(aqi_key))
+    if aqi_scale in ("canada", "uk"):
+        aqi_value = _aqi_value_from_pollutants(pollutants, aqi_scale)
     period = {
         "timestamp": current_time,
         "aqi": aqi_value,
-        "category": _aqi_category_from_us_aqi(aqi_value),
+        "category": _aqi_category_from_scale(aqi_value, aqi_scale),
         "pollutants": pollutants,
     }
 
@@ -2469,23 +2892,27 @@ def _openmeteo_air_quality_to_aeris_payload(payload):
             }
         ],
         "provider": "open-meteo",
+        "scale": aqi_scale,
     }
 
 
-def _fetch_openmeteo_aqi_payload(latitude, longitude):
+def _fetch_openmeteo_aqi_payload(latitude, longitude, aqi_scale="us"):
     """Fetch Open-Meteo Air Quality as the common AQI fallback payload."""
+    aqi_key = "european_aqi" if aqi_scale == "european" else "us_aqi"
     aqi_url = (
         "https://air-quality-api.open-meteo.com/v1/air-quality"
         f"?latitude={latitude}&longitude={longitude}"
-        "&current=us_aqi,pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,"
+        f"&current={aqi_key},pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,"
         "sulphur_dioxide,ozone"
         "&timezone=auto"
     )
     aqi_raw = _http_get_json(aqi_url, headers=HTTP_HEADERS["OPEN_METEO"])
-    return _openmeteo_air_quality_to_aeris_payload(aqi_raw)
+    return _openmeteo_air_quality_to_aeris_payload(aqi_raw, aqi_scale=aqi_scale)
 
 
-def _fetch_xweather_aqi_payload(forecast_place, forecast_api_id, forecast_api_secret):
+def _fetch_xweather_aqi_payload(
+    forecast_place, forecast_api_id, forecast_api_secret, aqi_scale="us"
+):
     """Fetch Xweather/Aeris Air Quality as the common AQI fallback payload."""
     aqi_url = (
         f"https://data.api.xweather.com/airquality/{forecast_place}"
@@ -2496,6 +2923,20 @@ def _fetch_xweather_aqi_payload(forecast_place, forecast_api_id, forecast_api_se
     if not isinstance(aqi_response, list) or not aqi_response:
         raise ValueError("Xweather air-quality response contained no usable data")
     aqi_payload.setdefault("provider", "aeris")
+    if aqi_scale in ("european", "canada", "uk"):
+        for response in aqi_payload["response"]:
+            for period in response.get("periods") or []:
+                aqi_value = _aqi_value_from_pollutants(
+                    period.get("pollutants"), aqi_scale
+                )
+                period["aqi"] = aqi_value
+                period["category"] = _aqi_category_from_scale(aqi_value, aqi_scale)
+        aqi_payload["success"] = any(
+            period.get("aqi") is not None
+            for response in aqi_payload["response"]
+            for period in response.get("periods") or []
+        )
+    aqi_payload["scale"] = aqi_scale
     return aqi_payload
 
 
@@ -2522,8 +2963,10 @@ def _cached_aqi_provider_from_forecast_data(forecast_data, aqi_payload):
     return _canonical_forecast_provider(provider)
 
 
-def _clear_aqi_payload_from_forecast_file(forecast_file, allowed_providers=None):
-    """Remove cached AQI when it is not allowed by the selected AQI source."""
+def _clear_aqi_payload_from_forecast_file(
+    forecast_file, allowed_providers=None, allowed_scale=None
+):
+    """Remove cached AQI when it is not allowed by the selected configuration."""
     try:
         if not os.path.isfile(forecast_file):
             return False
@@ -2532,16 +2975,21 @@ def _clear_aqi_payload_from_forecast_file(forecast_file, allowed_providers=None)
         if not isinstance(forecast_data, dict) or "aqi" not in forecast_data:
             return False
 
-        if allowed_providers is not None:
+        if allowed_providers is not None or allowed_scale is not None:
             allowed = {
                 _canonical_forecast_provider(provider)
-                for provider in allowed_providers
+                for provider in (allowed_providers or ())
             }
             aqi_array = forecast_data.get("aqi") or []
             aqi_payload = aqi_array[0] if aqi_array else None
-            if _cached_aqi_provider_from_forecast_data(
-                forecast_data, aqi_payload
-            ) in allowed:
+            cached_scale = (aqi_payload or {}).get("scale", "us")
+            provider_allowed = (
+                allowed_providers is None
+                or _cached_aqi_provider_from_forecast_data(forecast_data, aqi_payload)
+                in allowed
+            )
+            scale_allowed = allowed_scale is None or cached_scale == allowed_scale
+            if provider_allowed and scale_allowed:
                 return False
 
         del forecast_data["aqi"]
@@ -2598,11 +3046,18 @@ def _localized_aqi_category(category, label_dict):
     """Translate a provider AQI category key with skin labels."""
     aqi_category_labels = {
         "good": "aqi_good",
+        "low": "aqi_low",
+        "fair": "aqi_fair",
         "moderate": "aqi_moderate",
+        "high": "aqi_high",
         "usg": "aqi_usg",
         "unhealthy": "aqi_unhealthy",
+        "poor": "aqi_poor",
         "very unhealthy": "aqi_very_unhealthy",
+        "very poor": "aqi_very_poor",
         "hazardous": "aqi_hazardous",
+        "extremely poor": "aqi_extremely_poor",
+        "very high": "aqi_very_high",
     }
     label_key = aqi_category_labels.get(category, "aqi_unknown")
     return label_dict[label_key]
@@ -2624,8 +3079,12 @@ def _extract_aqi_globals_from_payload(aqi_payload, label_dict):
 
         category = _localized_aqi_category(period.get("category"), label_dict)
         place = (first_response.get("place") or {}).get("name", "")
+        if aqi_payload.get("provider") == "local-sensor":
+            place = label_dict["local_sensor"]
+        elif place:
+            place = place.title()
         point_time = period.get("timestamp", "")
-        return (aqi_value, category, place.title() if place else "", point_time)
+        return (aqi_value, category, place, point_time)
     except Exception:
         return ("No Data", label_dict["aqi_unknown"], "", "")
 
@@ -2812,6 +3271,7 @@ def _openmeteo_transform_to_belch(payload, forecast_units):
         "daily": daily,
         "alerts": [],
         "provider": "open-meteo",
+        "location_timezone": payload.get("timezone") or "",
         "units": forecast_units,
         "schema": "belchertown.forecast.v1",
         "generated_at": generated_at,
@@ -2945,6 +3405,9 @@ CHART_TEXT_SERIES_OPTIONS = frozenset(
         "yAxis_plotLine_label",
     )
 )
+# Numbered reference-line labels (yAxis_plotLine_label, yAxis_plotLine2_label,
+# ...) get the same ${label_key} resolution as the keys in the frozenset above.
+CHART_PLOTLINE_LABEL_RE = re.compile(r"^yAxis_plotLine\d*_label$")
 _UNRESOLVED_CHART_LABEL_TOKENS = set()
 
 
@@ -3529,6 +3992,18 @@ def _aeris_transform_to_belch(aeris_payload, forecast_units, label_dict, icon_ma
     if not hourly or not three_hourly or not daily:
         raise ValueError("Xweather forecast response contained no current forecast periods")
 
+    location_timezone = ""
+    try:
+        first_endpoint = aeris_payload.get("forecast_24hr", [])[0]
+        first_response = (first_endpoint.get("response") or [])[0]
+        location_timezone = (
+            (first_response.get("profile") or {}).get("tz")
+            or (first_response.get("place") or {}).get("tz")
+            or ""
+        )
+    except (AttributeError, IndexError, TypeError):
+        pass
+
     return {
         "current": [],
         "hourly": hourly,
@@ -3537,6 +4012,7 @@ def _aeris_transform_to_belch(aeris_payload, forecast_units, label_dict, icon_ma
         "alerts": _aeris_alerts_to_common(aeris_payload, label_dict),
         "aqi": aeris_payload.get("aqi", []),
         "provider": "aeris",
+        "location_timezone": location_timezone,
         "units": forecast_units,
         "schema": "belchertown.forecast.v1",
         "generated_at": _safe_epoch(aeris_payload.get("timestamp")) or int(time.time()),
@@ -4916,15 +5392,24 @@ class getData(SearchList):
         noaa_dir = os.path.join(html_root, noaa_relative_dir)
 
         try:
-            for html_root_entry in os.listdir(html_root):
-                html_root_entry_path = os.path.join(html_root, html_root_entry)
-                if (
-                    html_root_entry.lower() == "noaa"
-                    and os.path.isdir(html_root_entry_path)
-                ):
-                    noaa_relative_dir = html_root_entry
-                    noaa_dir = html_root_entry_path
-                    break
+            # Use directory entries to compare spelling. On a case-insensitive
+            # filesystem, isdir("noaa") also matches a directory named "NOAA",
+            # but that distinction matters after syncing to a Linux web server.
+            html_root_entries = os.listdir(html_root)
+            noaa_entries = [
+                entry
+                for entry in html_root_entries
+                if entry.lower() == noaa_relative_dir
+                and os.path.isdir(os.path.join(html_root, entry))
+            ]
+            if noaa_relative_dir in noaa_entries:
+                selected_noaa_dir = noaa_relative_dir
+            elif noaa_entries:
+                selected_noaa_dir = noaa_entries[0]
+            else:
+                selected_noaa_dir = noaa_relative_dir
+            noaa_relative_dir = selected_noaa_dir
+            noaa_dir = os.path.join(html_root, selected_noaa_dir)
 
             # Only process NOAA report files; ignore any other files (csv, etc.) in the directory.
             noaa_file_pattern = re.compile(r"^NOAA-(\d{4})(?:-(\d{2}))?\.txt$")
@@ -5373,7 +5858,6 @@ class getData(SearchList):
         belchertown_locale = extras_dict["belchertown_locale"]
         if belchertown_locale == "auto":
             try:
-                locale.setlocale(locale.LC_ALL, "")
                 system_locale, locale_encoding = locale.getlocale()
             except Exception:
                 system_locale, locale_encoding = None, None
@@ -6262,11 +6746,37 @@ class getData(SearchList):
 
         # Forecast enabled default should be on when missing.
         forecast_enabled = str(extras_dict.get("forecast_enabled", "1")).strip()
-        aqi_enabled = to_bool(extras_dict.get("aqi_enabled", "0"))
+        station_observations = _station_observation_entries(
+            extras_dict["station_observations"]
+        )
+        aqi_data_enabled = _aqi_data_is_requested(
+            extras_dict, station_observations
+        )
         aqi_source = _normalize_aqi_source(extras_dict.get("aqi_source", "auto"))
+        aqi_local_max_age = to_int(extras_dict.get("aqi_local_max_age", 7200))
+        if aqi_local_max_age is None or aqi_local_max_age < 0:
+            log.warning("Invalid aqi_local_max_age; falling back to 7200 seconds.")
+            aqi_local_max_age = 7200
+        configured_aqi_scale = _normalize_aqi_scale(
+            extras_dict.get("aqi_scale", "auto")
+        )
+        aqi_scale_is_auto = configured_aqi_scale == "auto"
+        aqi_scale = configured_aqi_scale
+        if aqi_scale_is_auto:
+            aqi_scale = _auto_aqi_scale(moment_js_tz, extras_dict)
+        else:
+            log.info("AQI scale configured as '%s'.", aqi_scale)
         extras_dict["aqi_source"] = aqi_source
-        local_aqi_enabled = aqi_enabled and aqi_source in ("auto", "local")
-        forecast_aqi_enabled = aqi_enabled and aqi_source in ("auto", "forecast")
+        local_aqi_enabled = (
+            aqi_data_enabled
+            and aqi_source in ("auto", "local")
+            and aqi_scale in VALID_AQI_SCALES
+            and aqi_scale != "auto"
+        )
+        forecast_aqi_enabled = aqi_data_enabled and aqi_source in (
+            "auto",
+            "forecast",
+        )
 
         # Ensure AQI variables are always defined to avoid NameError when forecast is disabled or fails
         # aqi and aqi_category are global so they can be used by Highcharts
@@ -6276,7 +6786,11 @@ class getData(SearchList):
         aqi_location = ""
         aqi_time = ""
         local_aqi_payload = (
-            _archive_local_aqi_payload(manager) if local_aqi_enabled else None
+            _archive_local_aqi_payload(
+                manager, aqi_scale=aqi_scale, max_age=aqi_local_max_age,
+            )
+            if local_aqi_enabled
+            else None
         )
         if local_aqi_payload is not None:
             (
@@ -6285,6 +6799,74 @@ class getData(SearchList):
                 aqi_location,
                 aqi_time,
             ) = _extract_aqi_globals_from_payload(local_aqi_payload, label_dict)
+
+        # AQI is independently useful when the forecast display is disabled.
+        # Keep a small standalone cache so this does not trigger a download on
+        # every Cheetah search-list invocation.
+        if (
+            aqi_data_enabled
+            and local_aqi_payload is None
+            and forecast_aqi_enabled
+            and forecast_enabled != "1"
+        ):
+            standalone_aqi_file = os.path.join(html_root, "json", "aqi.json")
+            standalone_aqi_payload = None
+            try:
+                stale_seconds = int(extras_dict.get("forecast_stale", 3600))
+                if (
+                    os.path.isfile(standalone_aqi_file)
+                    and time.time() - os.path.getmtime(standalone_aqi_file) <= stale_seconds
+                ):
+                    with open(standalone_aqi_file, "r", encoding="utf-8") as fh:
+                        cached_payload = json.load(fh)
+                    expected_provider = _aqi_forecast_provider_for_forecast_provider(
+                        forecast_provider
+                    )
+                    if (
+                        _canonical_forecast_provider(cached_payload.get("provider"))
+                        == _canonical_forecast_provider(expected_provider)
+                        and cached_payload.get("scale", "us") == aqi_scale
+                    ):
+                        standalone_aqi_payload = cached_payload
+            except (OSError, ValueError, AttributeError):
+                standalone_aqi_payload = None
+
+            if standalone_aqi_payload is None:
+                try:
+                    standalone_provider = _aqi_forecast_provider_for_forecast_provider(
+                        forecast_provider
+                    )
+                    if standalone_provider == "open-meteo":
+                        standalone_lat, standalone_lon = _resolve_forecast_lat_lon(
+                            config_dict["Station"].get("latitude"),
+                            config_dict["Station"].get("longitude"),
+                            extras_dict.get("forecast_place", ""),
+                        )
+                        if standalone_lat is not None and standalone_lon is not None:
+                            standalone_aqi_payload = _fetch_openmeteo_aqi_payload(
+                                standalone_lat, standalone_lon, aqi_scale=aqi_scale
+                            )
+                    elif standalone_provider == "aeris":
+                        standalone_aqi_payload = _fetch_xweather_aqi_payload(
+                            extras_dict.get("forecast_place", ""),
+                            extras_dict.get("forecast_api_id", ""),
+                            extras_dict.get("forecast_api_secret", ""),
+                            aqi_scale=aqi_scale,
+                        )
+                    if standalone_aqi_payload is not None:
+                        _write_json_file(standalone_aqi_file, standalone_aqi_payload)
+                except Exception as e:
+                    log.warning("Standalone AQI update failed. Reason: %s", e)
+
+            if standalone_aqi_payload is not None:
+                (
+                    aqi,
+                    aqi_category,
+                    aqi_location,
+                    aqi_time,
+                ) = _extract_aqi_globals_from_payload(
+                    standalone_aqi_payload, label_dict
+                )
 
         # ----------------------------
         # Pirate Weather
@@ -6312,6 +6894,30 @@ class getData(SearchList):
                     log.error(
                         f"Unable to create forecast json directory {forecast_json_dir}: {e}"
                     )
+
+                if aqi_scale_is_auto and os.path.isfile(forecast_file):
+                    try:
+                        with open(forecast_file, "r", encoding="utf-8") as fh:
+                            cached_forecast = json.load(fh)
+                        cached_timezone = cached_forecast.get("location_timezone")
+                    except (OSError, ValueError, AttributeError):
+                        cached_timezone = ""
+                    if cached_timezone:
+                        aqi_scale = _auto_aqi_scale(cached_timezone, extras_dict)
+                        local_aqi_enabled = (
+                            aqi_data_enabled
+                            and aqi_source in ("auto", "local")
+                            and aqi_scale in VALID_AQI_SCALES
+                            and aqi_scale != "auto"
+                        )
+                        local_aqi_payload = (
+                            _archive_local_aqi_payload(
+                                manager, aqi_scale=aqi_scale,
+                                max_age=aqi_local_max_age,
+                            )
+                            if local_aqi_enabled
+                            else None
+                        )
 
                 forecast_api_id = extras_dict.get("forecast_api_id", "")
                 forecast_api_secret = extras_dict.get("forecast_api_secret", "")
@@ -6381,7 +6987,9 @@ class getData(SearchList):
                         return None
                     if _canonical_forecast_provider(
                         cached_aqi.get("provider")
-                    ) == _canonical_forecast_provider(provider_key):
+                    ) == _canonical_forecast_provider(provider_key) and (
+                        cached_aqi.get("scale", "us") == aqi_scale
+                    ):
                         return cached_aqi
                     return None
 
@@ -6401,7 +7009,9 @@ class getData(SearchList):
                         return None
 
                     try:
-                        aqi_payload = _fetch_openmeteo_aqi_payload(aqi_lat, aqi_lon)
+                        aqi_payload = _fetch_openmeteo_aqi_payload(
+                            aqi_lat, aqi_lon, aqi_scale=aqi_scale
+                        )
                         if _merge_aqi_payload_into_forecast_file(
                             forecast_file, aqi_payload
                         ):
@@ -6430,6 +7040,7 @@ class getData(SearchList):
                             forecast_place,
                             forecast_api_id,
                             forecast_api_secret,
+                            aqi_scale=aqi_scale,
                         )
                         if _merge_aqi_payload_into_forecast_file(
                             forecast_file, aqi_payload
@@ -6448,14 +7059,17 @@ class getData(SearchList):
                 def _refresh_local_aqi_payload():
                     nonlocal local_aqi_payload
                     local_aqi_payload = (
-                        _archive_local_aqi_payload(manager)
+                        _archive_local_aqi_payload(
+                            manager, aqi_scale=aqi_scale,
+                            max_age=aqi_local_max_age,
+                        )
                         if local_aqi_enabled
                         else None
                     )
                     return local_aqi_payload
 
                 def _refresh_aqi_payload(force=False):
-                    if not aqi_enabled:
+                    if not aqi_data_enabled:
                         return None
 
                     if local_aqi_enabled:
@@ -6494,7 +7108,9 @@ class getData(SearchList):
                         return None
 
                     if _clear_aqi_payload_from_forecast_file(
-                        forecast_file, allowed_providers=(forecast_aqi_provider,)
+                        forecast_file,
+                        allowed_providers=(forecast_aqi_provider,),
+                        allowed_scale=aqi_scale,
                     ):
                         log.debug(
                             "Cached AQI removed because it does not match "
@@ -6743,6 +7359,7 @@ class getData(SearchList):
                                     observation_payload=observation_data,
                                     alerts_payload=alerts_data,
                                     forecast_units=forecast_units,
+                                    location_timezone=points_props.get("timeZone", ""),
                                 )
                                 _write_normalized_forecast_file(
                                     forecast_file, normalized
@@ -6867,6 +7484,16 @@ class getData(SearchList):
                                 om_raw = _http_get_json(
                                     om_url, headers=HTTP_HEADERS["OPEN_METEO"]
                                 )
+                                if aqi_scale_is_auto:
+                                    aqi_scale = _auto_aqi_scale(
+                                        om_raw.get("timezone"), extras_dict
+                                    )
+                                    local_aqi_enabled = (
+                                        aqi_data_enabled
+                                        and aqi_source in ("auto", "local")
+                                        and aqi_scale in VALID_AQI_SCALES
+                                        and aqi_scale != "auto"
+                                    )
                                 normalized = _openmeteo_transform_to_belch(
                                     om_raw, forecast_units
                                 )
@@ -7591,9 +8218,6 @@ class getData(SearchList):
         station_obs_source_json = OrderedDict()
         station_obs_unit_json = OrderedDict()
         station_obs_parts = []
-        station_observations = _station_observation_entries(
-            extras_dict["station_observations"]
-        )
         default_current_stamp = manager.lastGoodStamp()
         default_current_record = manager.getRecord(default_current_stamp)
         default_current = weewx.tags.CurrentObj(
@@ -7664,6 +8288,24 @@ class getData(SearchList):
 
                 # Empty field for the JSON "current" output
                 obs_output = ""
+            elif obs == "ET":
+                # ET shows daily sum instead of the tiny per-interval instantaneous value
+                obs_binder = weewx.tags.ObservationBinder(
+                    "ET",
+                    archiveDaySpan(current_stamp),
+                    db_lookup,
+                    obs_binding,
+                    "day",
+                    self.generator.formatter,
+                    self.generator.converter,
+                )
+                obs_output = getattr(obs_binder, "sum")
+                obs_meta = _unit_switch_station_observation_meta("ET", obs_output)
+                if obs_meta:
+                    # Keep this distinct from the per-archive ET MQTT field.
+                    obs_meta["selector"] = ".dayET"
+                    obs_meta["mqtt_keys"] = ["dayET_mm"]
+                    station_obs_unit_json["dayET"] = obs_meta
             elif obs == "cloud_cover":
                 obs_output = cloud_cover
                 obs_source = EXTERNAL_STATION_OBSERVATION_SOURCES.get(obs)
@@ -7691,21 +8333,29 @@ class getData(SearchList):
                 obs_output = "N/A"
                 obs_output_str = "N/A"
 
-            # Build the json "current" array for weewx_data.json for JavaScript
-            if obs not in station_obs_json:
-                station_obs_json[obs] = obs_output_str
+            # Build the json "current" array for weewx_data.json for JavaScript.
+            # ET is reported as a daily total in this table, so do not reuse the
+            # per-archive ET key that MQTT publishes.
+            station_obs_key = "dayET" if obs == "ET" else obs
+            if station_obs_key not in station_obs_json:
+                station_obs_json[station_obs_key] = obs_output_str
             if obs_source is not None and obs not in station_obs_source_json:
                 station_obs_source_json[obs] = dict(obs_source)
 
             # Build the HTML for the front page (accumulate into list, join later)
+            station_obs_label = (
+                "dayET" if obs == "ET" and "dayET" in label_dict else obs
+            )
             row_parts = [
-                f"<tr data-observation='{html.escape(obs, quote=True)}'>",
-                f"<td class='station-observations-label'>{label_dict[obs]}</td>",
+                f"<tr data-observation='{html.escape(station_obs_key, quote=True)}'>",
+                f"<td class='station-observations-label'>{label_dict[station_obs_label]}</td>",
                 "<td>",
             ]
             if obs == "rainWithRainRate":
                 # Add special rain + rainRate stacked value
                 row_parts.append(obs_rain_output)
+            elif obs == "ET":
+                row_parts.append(f"<span class='dayET'>{obs_output_str}</span>")
             elif obs == "cloud_cover" and obs_output_str not in ("", "N/A"):
                 cloud_cover_unit_label = skin_dict["Units"]["Labels"].get(
                     "percent", "%"
@@ -7815,7 +8465,7 @@ class getData(SearchList):
             "percent", "%"
         )
         for obs, obs_meta in station_obs_unit_json.items():
-            obs_name = "rain" if obs == "dayRain" else obs
+            obs_name = {"dayRain": "rain", "dayET": "ET"}.get(obs, obs)
             if "decimals" not in obs_meta and obs_name in all_obs_rounding_json:
                 try:
                     obs_meta["decimals"] = int(all_obs_rounding_json[obs_name])
@@ -7993,7 +8643,7 @@ class getData(SearchList):
 
         # Build the search list with the new values
         search_list_extension = {
-            "belchertown_version": "2.1beta4",
+            "belchertown_version": VERSION,
             "asset_suffix": asset_suffix,
             "belchertown_debug": belchertown_debug,
             "moment_js_utc_offset": moment_js_utc_offset,
@@ -8109,6 +8759,7 @@ class getData(SearchList):
             "social_html": social_html,
             "custom_css_exists": custom_css_exists,
             "aqi": aqi,
+            "aqi_scale": aqi_scale,
             "aqi_category": aqi_category,
             "aqi_location": aqi_location,
             "aqi_time": aqi_time,
@@ -8460,7 +9111,7 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
             )  # This retains the order in which to load the charts on the page.
             chart_options = accumulateLeaves(self.chart_dict[chart_group])
 
-            output[chart_group]["belchertown_version"] = "2.1beta4"
+            output[chart_group]["belchertown_version"] = VERSION
             output[chart_group]["generated_timestamp"] = generated_timestamp
 
             # Setup the JSON file name for each chart group
@@ -9046,7 +9697,10 @@ class HighchartsJsonGenerator(weewx.reportengine.ReportGenerator):
                     for highcharts_config, highcharts_value in self.chart_dict[
                         chart_group
                     ][plotname][line_name].items():
-                        if highcharts_config in CHART_TEXT_SERIES_OPTIONS:
+                        if (
+                            highcharts_config in CHART_TEXT_SERIES_OPTIONS
+                            or CHART_PLOTLINE_LABEL_RE.match(highcharts_config)
+                        ):
                             highcharts_value = _resolve_chart_label_text(
                                 highcharts_value,
                                 d,
