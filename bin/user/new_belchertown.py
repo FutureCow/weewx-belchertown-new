@@ -5710,7 +5710,7 @@ class getData(SearchList):
             )
         return self._build_windy_radar(
             width, height, lat, lon, zoom, rain, wind, temp, marker == "true",
-            overlay
+            overlay, extras_dict.get("radar_autoplay") == "1"
         )
 
     def _get_radar_html_dark(self, extras_dict, lat, lon, zoom, overlay, width, height):
@@ -5750,9 +5750,11 @@ class getData(SearchList):
             f'fetchpriority="low" referrerpolicy="no-referrer"></img>'
         )
 
-    def _build_windy_radar(self, width, height, lat, lon, zoom, rain, wind, temp, marker, overlay):
+    def _build_windy_radar(self, width, height, lat, lon, zoom, rain, wind, temp, marker, overlay,
+                           autoplay=False):
         """Build Windy.com embedded radar HTML."""
         marker_str = "true" if marker else "false"
+        play_str = "&play=1" if autoplay else ""
         src = (
             f"https://embed.windy.com/embed2.html?lat={lat}&lon={lon}"
             f"&zoom={zoom}&level=surface"
@@ -5761,7 +5763,7 @@ class getData(SearchList):
             f"&marker={marker_str}&calendar=&pressure=&type=map"
             f"&location=coordinates&detail=&detailLat={lat}&detailLon={lon}"
             f"&metricRain={rain}&metricWind={wind}&metricTemp={temp}"
-            f"&radarRange=-1"
+            f"&radarRange=-1{play_str}"
         )
         return self._build_radar_iframe_from_src(src, width, height)
 
