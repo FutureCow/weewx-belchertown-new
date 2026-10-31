@@ -140,7 +140,7 @@ HTTP_HEADERS = {
     },
     "METEOALARM": {
         "User-Agent": "weewx-belchertown-new/meteoalarm",
-        "Accept": "application/atom+xml, application/xml, text/xml",
+        "Accept": "application/atom+xml, application/xml, text/xml, */*",
         "Connection": "keep-alive",
     },
 }
@@ -2274,11 +2274,15 @@ def _meteoalarm_build_alerts(feed_xml, geocode_filters=None, area_filters=None):
     geocode_filters = set(value.upper() for value in (geocode_filters or []))
     area_filters = [value.lower() for value in (area_filters or [])]
 
+    now = time.time()
     output = []
     for entry in entries:
         if not _meteoalarm_entry_matches(entry, geocode_filters, area_filters):
             continue
-        output.append(_meteoalarm_entry_to_alert(entry))
+        alert = _meteoalarm_entry_to_alert(entry)
+        if alert["expires"] is not None and alert["expires"] <= now:
+            continue
+        output.append(alert)
     return output
 
 
